@@ -148,6 +148,13 @@ The app must support account registration, login, session display, and logout.
 
 Current client implementation may include a UI-only authentication scaffold for early product iteration, but it must not be treated as production authentication.
 
+Current account rules:
+
+- Display names are user-facing identifiers and must be non-empty.
+- Display names are limited to 40 characters.
+- Display names must be unique case-insensitively across users during registration and account profile updates.
+- If a requested display name is already occupied, the backend must reject the request and the Android UI must show a textual error instead of silently changing the name.
+
 Production authentication requirements:
 
 - Registration and login must be verified by the backend.
@@ -363,6 +370,7 @@ Current interaction style:
 - Press feedback should stay subtle and low-cost; prefer short tweened scale feedback over bouncy springs for repeated controls.
 - Keep account editing and calendar details visually inline with the main page unless the user explicitly asks for modal behavior.
 - The app uses a bottom three-tab structure: main screen, friends, and mine. Friend management belongs in the friends tab, and account/user management belongs in the mine tab.
+- The bottom three-tab bar should feel like a polished app navigation control, not plain form buttons: use a floating rounded container, subtle theme-colored active state, compact glyphs, restrained motion, and globally theme-managed colors.
 - Calendar friend filtering should stay compact. Prefer a small muted text selector that expands into a lightweight scrollable rectangle over always showing many friend filter buttons.
 - Calendar month/year cells should show people counts only in the all-friends view. When filtered to one friend, cells should use the one-person heat color and omit `x人` count labels.
 - The default calendar mode when entering the main screen is month view.
@@ -388,6 +396,7 @@ Current interaction style:
 - Calendar content should support horizontal swipe navigation: in week view swipe left/right moves to the next/previous week, in month view to the next/previous month, and in year view to the next/previous year.
 - Calendar week view must render a natural Monday-to-Sunday week and must not truncate at month boundaries.
 - The app supports three user-selectable visual palettes from the Mine page: Muelsyse, Shu, and Mizuki. The selected palette is stored locally and should apply globally after switching.
+- Buttons, text buttons, and outlined buttons must use theme-managed colors from the current `TouchColors` palette, including disabled states. Avoid default Material button text colors when they produce pure black text or overly pale text against the active visual theme.
 - Mizuki is the default palette.
 - Muelsyse uses cool mint, aqua, ivory, deep teal-gray, and restrained pale gold accents.
 - Shu uses warmer rice-field tones: olive green, grain gold, ivory, muted earth, and calm tea-gold heat states.
@@ -541,6 +550,11 @@ The current implementation includes the first working NFC tap-to-meet loop:
 - Short-lived meet tokens are one-time use and expire after 120 seconds.
 - Self-meetings are rejected by the backend.
 - NFC payloads contain only protocol version, short-lived token, issued time, and expiry time. They do not include email, permanent user ID, refresh token, access token, phone number, or display name.
+- The backend now writes user-scoped realtime events for friend requests, friend request responses, friend removals, and confirmed meetings.
+- The Android app opens an authenticated foreground SSE connection to `GET /events/stream` after login.
+- Realtime events are treated as notifications to refresh authoritative backend state, not as client-side proof of friendship or meeting state.
+- When a confirmed meeting event is received, the app refreshes meeting data and shows a lightweight animated floating success notice.
+- When a friend event is received, the app refreshes friend data and shows a lightweight animated floating notice.
 
 Current Android NFC files:
 
@@ -556,6 +570,7 @@ Current backend NFC-related storage:
 meet_tokens
 meeting_proof_submissions
 meetings
+user_events
 ```
 
 Current implementation limitations:
@@ -565,6 +580,7 @@ Current implementation limitations:
 - Pending offline proof storage is not implemented. If NFC succeeds but the network request fails, the user must retry.
 - The current deployment still uses HTTP by IP for testing. Production tap proof submission must use HTTPS.
 - Session persistence currently uses private `SharedPreferences`; production builds must migrate refresh-token storage to Android Keystore-backed encrypted storage.
+- Realtime delivery currently uses foreground SSE only. Production background delivery should add vendor push or FCM, while keeping backend event persistence for missed-event recovery.
 
 Next hardening step:
 

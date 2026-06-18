@@ -246,6 +246,14 @@ def init_db() -> None:
                 friend_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 PRIMARY KEY (event_id, friend_user_id)
             );
+
+            CREATE TABLE IF NOT EXISTS user_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
             """
         )
         columns = {row["name"] for row in db.execute("PRAGMA table_info(users)").fetchall()}
@@ -297,6 +305,21 @@ def public_user(user: User) -> dict[str, Any]:
 
 def public_user_row(row: sqlite3.Row) -> dict[str, Any]:
     return public_user(user_from_row(row))
+
+
+def display_name_is_taken(db: sqlite3.Connection, display_name: str, excluding_user_id: str | None = None) -> bool:
+    normalized = display_name.strip()
+    if excluding_user_id:
+        row = db.execute(
+            "SELECT id FROM users WHERE lower(display_name) = lower(?) AND id != ? LIMIT 1",
+            (normalized, excluding_user_id),
+        ).fetchone()
+    else:
+        row = db.execute(
+            "SELECT id FROM users WHERE lower(display_name) = lower(?) LIMIT 1",
+            (normalized,),
+        ).fetchone()
+    return row is not None
 
 
 def public_meeting(row: sqlite3.Row) -> dict[str, Any]:
@@ -394,6 +417,35 @@ def public_day_event(db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]
         "participants": [public_user_row(participant) for participant in participant_rows],
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
+    }
+
+
+def create_user_event(
+    db: sqlite3.Connection,
+    user_id: str,
+    event_type: str,
+    payload: dict[str, Any],
+    created_at: int | None = None,
+) -> None:
+    db.execute(
+        """
+        INSERT INTO user_events (user_id, event_type, payload_json, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (user_id, event_type, json.dumps(payload, ensure_ascii=False), created_at or utc_now()),
+    )
+
+
+def public_user_event(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        payload = json.loads(row["payload_json"])
+    except json.JSONDecodeError:
+        payload = {}
+    return {
+        "id": row["id"],
+        "type": row["event_type"],
+        "payload": payload if isinstance(payload, dict) else {},
+        "createdAt": row["created_at"],
     }
 
 
@@ -724,6 +776,12 @@ class TouchHandler(BaseHTTPRequestHandler):
             if method == "GET" and path == "/day-events":
                 self.handle_day_events()
                 return
+            if method == "GET" and path == "/events":
+                self.handle_events()
+                return
+            if method == "GET" and path == "/events/stream":
+                self.handle_events_stream()
+                return
             if method == "GET" and path.startswith("/uploads/avatars/"):
                 self.handle_avatar_file(path)
                 return
@@ -811,6 +869,8 @@ class TouchHandler(BaseHTTPRequestHandler):
         password = str(body.get("password", ""))
         if not display_name:
             raise ApiError(400, "missing_display_name", "Display name is required.")
+        if len(display_name) > 40:
+            raise ApiError(400, "display_name_too_long", "Display name is too long.")
         validate_password(password)
 
         user_id = f"user_{uuid.uuid4().hex}"
@@ -819,6 +879,8 @@ class TouchHandler(BaseHTTPRequestHandler):
 
         try:
             with connect_db() as db:
+                if display_name_is_taken(db, display_name):
+                    raise ApiError(409, "display_name_taken", "这个昵称已被占用，请换一个昵称。")
                 db.execute(
                     """
                     INSERT INTO users (id, display_name, email, password_salt, password_hash, created_at)
@@ -934,6 +996,8 @@ class TouchHandler(BaseHTTPRequestHandler):
             raise ApiError(400, "display_name_too_long", "Display name is too long.")
 
         with connect_db() as db:
+            if display_name_is_taken(db, display_name, excluding_user_id=user_id):
+                raise ApiError(409, "display_name_taken", "这个昵称已被占用，请换一个昵称。")
             db.execute("UPDATE users SET display_name = ? WHERE id = ?", (display_name, user_id))
             row = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
             if row is None:
@@ -1048,6 +1112,62 @@ class TouchHandler(BaseHTTPRequestHandler):
             payload = [public_friendship(db, row, user_id) for row in rows]
         self.respond_json(200, {"friendships": payload})
 
+    def handle_events(self) -> None:
+        user_id = get_authenticated_user_id(self.request_headers())
+        params = parse_qs(urlparse(self.path).query)
+        after_id = int(params.get("afterId", ["0"])[0] or "0")
+        with connect_db() as db:
+            rows = db.execute(
+                """
+                SELECT * FROM user_events
+                WHERE user_id = ? AND id > ?
+                ORDER BY id ASC
+                LIMIT 100
+                """,
+                (user_id, after_id),
+            ).fetchall()
+        self.respond_json(200, {"events": [public_user_event(row) for row in rows]})
+
+    def handle_events_stream(self) -> None:
+        user_id = get_authenticated_user_id(self.request_headers())
+        params = parse_qs(urlparse(self.path).query)
+        last_id = int(params.get("afterId", ["0"])[0] or "0")
+
+        self.send_response(200)
+        self.write_common_headers()
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        started_at = utc_now()
+        try:
+            while utc_now() - started_at < 300:
+                with connect_db() as db:
+                    rows = db.execute(
+                        """
+                        SELECT * FROM user_events
+                        WHERE user_id = ? AND id > ?
+                        ORDER BY id ASC
+                        LIMIT 25
+                        """,
+                        (user_id, last_id),
+                    ).fetchall()
+                if rows:
+                    for row in rows:
+                        event = public_user_event(row)
+                        last_id = int(event["id"])
+                        raw = json.dumps(event, ensure_ascii=False)
+                        self.wfile.write(f"id: {last_id}\n".encode("utf-8"))
+                        self.wfile.write(f"event: {event['type']}\n".encode("utf-8"))
+                        self.wfile.write(f"data: {raw}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                else:
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+                time.sleep(2)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            return
+
     def handle_friend_search(self) -> None:
         user_id = get_authenticated_user_id(self.request_headers())
         params = parse_qs(urlparse(self.path).query)
@@ -1108,6 +1228,18 @@ class TouchHandler(BaseHTTPRequestHandler):
                 return
             row = get_friendship_between(db, requester_user_id, target_user_id)
             payload = public_friendship(db, row, requester_user_id)
+            target_payload = public_friendship(db, row, target_user_id)
+            requester = db.execute("SELECT * FROM users WHERE id = ?", (requester_user_id,)).fetchone()
+            create_user_event(
+                db,
+                target_user_id,
+                "friend_request_received",
+                {
+                    "friendship": target_payload,
+                    "fromUser": public_user_row(requester) if requester else None,
+                },
+                now,
+            )
         self.respond_json(201, {"friendship": payload})
 
     def handle_friend_request_respond(self) -> None:
@@ -1128,6 +1260,17 @@ class TouchHandler(BaseHTTPRequestHandler):
             db.execute("UPDATE friendships SET status = ?, updated_at = ? WHERE id = ?", (next_status, now, friendship_id))
             updated = db.execute("SELECT * FROM friendships WHERE id = ?", (friendship_id,)).fetchone()
             payload = public_friendship(db, updated, user_id)
+            event_type = "friend_request_accepted" if action == "accept" else "friend_request_rejected"
+            create_user_event(
+                db,
+                row["requester_user_id"],
+                event_type,
+                {
+                    "friendship": public_friendship(db, updated, row["requester_user_id"]),
+                    "fromUser": public_user_row(db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()),
+                },
+                now,
+            )
         self.respond_json(200, {"friendship": payload})
 
     def handle_friend_remove(self) -> None:
@@ -1146,6 +1289,14 @@ class TouchHandler(BaseHTTPRequestHandler):
                 WHERE id = ?
                 """,
                 (now, row["id"]),
+            )
+            other_user_id = row["addressee_user_id"] if row["requester_user_id"] == user_id else row["requester_user_id"]
+            create_user_event(
+                db,
+                other_user_id,
+                "friend_removed",
+                {"friendUserId": user_id},
+                now,
             )
         self.respond_json(200, {"status": "removed"})
 
@@ -1467,6 +1618,29 @@ class TouchHandler(BaseHTTPRequestHandler):
                 ),
             )
             meeting_row = db.execute("SELECT * FROM meetings WHERE id = ?", (scanner_meeting_id,)).fetchone()
+            scanned_meeting_row = db.execute("SELECT * FROM meetings WHERE id = ?", (scanned_meeting_id,)).fetchone()
+            create_user_event(
+                db,
+                scanner_user_id,
+                "meeting_confirmed",
+                {
+                    "meeting": public_meeting(meeting_row),
+                    "peer": public_user_row(scanned),
+                    "role": "scanner",
+                },
+                now,
+            )
+            create_user_event(
+                db,
+                scanned_user_id,
+                "meeting_confirmed",
+                {
+                    "meeting": public_meeting(scanned_meeting_row),
+                    "peer": public_user_row(scanner),
+                    "role": "scanned",
+                },
+                now,
+            )
 
         self.respond_json(201, {"status": "confirmed", "meeting": public_meeting(meeting_row)})
 

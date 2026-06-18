@@ -81,7 +81,100 @@ data class MeetingProofResultDto(
     val friendship: FriendshipDto?
 )
 
+data class RealtimeEventDto(
+    val id: Long,
+    val type: String,
+    val payload: JSONObject
+)
+
 class AuthApiException(message: String) : Exception(message)
+
+class RealtimeEventConnection(
+    private val baseUrl: String,
+    private val accessToken: String,
+    private val onEvent: (RealtimeEventDto) -> Unit,
+    private val onError: (Exception) -> Unit
+) {
+    @Volatile
+    private var closed = false
+
+    @Volatile
+    private var activeConnection: HttpURLConnection? = null
+
+    private var lastEventId = 0L
+
+    private val worker = Thread {
+        while (!closed) {
+            var connection: HttpURLConnection? = null
+            try {
+                connection = (URL("$baseUrl/events/stream?afterId=$lastEventId").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 6_000
+                    readTimeout = 0
+                    setRequestProperty("Accept", "text/event-stream")
+                    setRequestProperty("Authorization", "Bearer $accessToken")
+                }
+                activeConnection = connection
+                val status = connection.responseCode
+                if (status !in 200..299) {
+                    throw AuthApiException("\u5b9e\u65f6\u8fde\u63a5\u6682\u65f6\u4e0d\u53ef\u7528")
+                }
+                BufferedReader(InputStreamReader(connection.inputStream, Charsets.UTF_8)).use { reader ->
+                    val dataLines = mutableListOf<String>()
+                    while (!closed) {
+                        val line = reader.readLine() ?: break
+                        when {
+                            line.isBlank() -> {
+                                if (dataLines.isNotEmpty()) {
+                                    val rawData = dataLines.joinToString("\n")
+                                    val json = JSONObject(rawData)
+                                    val event = RealtimeEventDto(
+                                        id = json.optLong("id", lastEventId),
+                                        type = json.optString("type"),
+                                        payload = json.optJSONObject("payload") ?: JSONObject()
+                                    )
+                                    if (event.id > lastEventId) {
+                                        lastEventId = event.id
+                                    }
+                                    onEvent(event)
+                                    dataLines.clear()
+                                }
+                            }
+                            line.startsWith("data:") -> dataLines += line.removePrefix("data:").trimStart()
+                        }
+                    }
+                }
+            } catch (error: Exception) {
+                if (!closed) {
+                    onError(error)
+                    try {
+                        Thread.sleep(2_000)
+                    } catch (_: InterruptedException) {
+                        return@Thread
+                    }
+                }
+            } finally {
+                if (activeConnection === connection) {
+                    activeConnection = null
+                }
+                connection?.disconnect()
+            }
+        }
+    }.apply {
+        name = "touch-realtime-events"
+        isDaemon = true
+    }
+
+    fun start() {
+        worker.start()
+    }
+
+    fun close() {
+        closed = true
+        activeConnection?.disconnect()
+        worker.interrupt()
+    }
+}
 
 class AuthApiClient(
     private val baseUrl: String = DEFAULT_BASE_URL
@@ -316,6 +409,27 @@ class AuthApiClient(
         )
     }
 
+    fun openRealtimeEvents(
+        accessToken: String,
+        onEvent: (RealtimeEventDto) -> Unit,
+        onError: (Exception) -> Unit
+    ): RealtimeEventConnection {
+        return RealtimeEventConnection(
+            baseUrl = baseUrl,
+            accessToken = accessToken,
+            onEvent = onEvent,
+            onError = onError
+        ).also { it.start() }
+    }
+
+    fun getRealtimeEvents(accessToken: String, afterId: Long): List<RealtimeEventDto> {
+        val json = requestWithoutBody("GET", "/events?afterId=$afterId", accessToken)
+        val array = json.getJSONArray("events")
+        return (0 until array.length()).map { index ->
+            parseRealtimeEvent(array.getJSONObject(index))
+        }
+    }
+
     private fun requestWithoutBody(
         method: String,
         path: String,
@@ -455,6 +569,14 @@ class AuthApiClient(
             participants = (0 until participants.length()).map { index ->
                 parseFriendUser(participants.getJSONObject(index))
             }
+        )
+    }
+
+    private fun parseRealtimeEvent(json: JSONObject): RealtimeEventDto {
+        return RealtimeEventDto(
+            id = json.getLong("id"),
+            type = json.getString("type"),
+            payload = json.optJSONObject("payload") ?: JSONObject()
         )
     }
 

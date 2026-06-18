@@ -19,11 +19,13 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
@@ -67,6 +69,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -105,6 +108,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.foundation.text.KeyboardOptions
 import com.shinochanwww.touch.ui.theme.TouchTheme
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.IOException
 import java.io.ByteArrayOutputStream
@@ -192,7 +200,9 @@ private const val INLINE_ENTER_MS = 120
 private const val INLINE_EXIT_MS = 80
 private const val PRESS_ANIMATION_MS = 85
 private const val DRAG_FEEDBACK_MS = 90
-private const val REBOUND_ANIMATION_MS = 260
+private const val REBOUND_ANIMATION_MS = 430
+private const val CALENDAR_SIZE_ANIMATION_MS = 240
+private const val CALENDAR_CONTENT_ANIMATION_MS = 150
 
 private data class UserSession(
     val userId: String,
@@ -296,6 +306,19 @@ private data class PendingFriendPrompt(
     val user: FriendUser,
     val friendship: Friendship?
 )
+
+private data class FloatingRealtimeNotice(
+    val id: Long,
+    val title: String,
+    val message: String,
+    val kind: RealtimeNoticeKind
+)
+
+private enum class RealtimeNoticeKind {
+    Meeting,
+    Friend,
+    Neutral
+}
 
 private data class CalendarMeeting(
     val day: Int,
@@ -605,7 +628,7 @@ private fun AuthScreen(
                             .fillMaxWidth()
                             .height(54.dp),
                         shape = RoundedCornerShape(8.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = TouchColors.Primary)
+                        colors = touchPrimaryButtonColors()
                     ) {
                         Text(
                             text = when {
@@ -634,11 +657,11 @@ private fun AuthScreen(
                                 mode = if (isLogin) AuthMode.Register else AuthMode.Login
                                 errorText = null
                                 isSubmitting = false
-                            }
+                            },
+                            colors = touchTextButtonColors()
                         ) {
                             Text(
                                 text = if (isLogin) "\u53bb\u6ce8\u518c" else "\u53bb\u767b\u5f55",
-                                color = TouchColors.Primary,
                                 fontWeight = FontWeight.SemiBold
                             )
                         }
@@ -705,6 +728,9 @@ private fun TouchHomeScreen(
     var isPreparingTap by remember { mutableStateOf(false) }
     var isScanningTap by remember { mutableStateOf(false) }
     var tapDialogMode by remember { mutableStateOf<TapDialogMode?>(null) }
+    var realtimeNotice by remember { mutableStateOf<FloatingRealtimeNotice?>(null) }
+    var lastRealtimeEventId by remember(session.userId) { mutableStateOf(0L) }
+    var realtimeReady by remember(session.userId) { mutableStateOf(false) }
     val acceptedFriends by remember(friendships) {
         derivedStateOf {
             friendships
@@ -765,12 +791,132 @@ private fun TouchHomeScreen(
             }
         }.start()
     }
+    val handleRealtimeEvent: (RealtimeEventDto) -> Unit = { event ->
+        if (!realtimeReady) {
+            if (event.id > lastRealtimeEventId) {
+                lastRealtimeEventId = event.id
+            }
+        } else if (event.id > lastRealtimeEventId) {
+            lastRealtimeEventId = event.id
+            when (event.type) {
+                "meeting_confirmed" -> {
+                    val peerName = event.payload.optJSONObject("peer")
+                        ?.optString("displayName")
+                        ?.takeIf { it.isNotBlank() }
+                        ?: "\u597d\u53cb"
+                    realtimeNotice = FloatingRealtimeNotice(
+                        id = event.id,
+                        title = "\u78b0\u4e00\u78b0\u6210\u529f",
+                        message = "\u548c $peerName \u5df2\u786e\u8ba4\u89c1\u9762",
+                        kind = RealtimeNoticeKind.Meeting
+                    )
+                    refreshMeetings()
+                }
+                "friend_request_received" -> {
+                    val fromName = event.payload.optJSONObject("fromUser")
+                        ?.optString("displayName")
+                        ?.takeIf { it.isNotBlank() }
+                        ?: "\u65b0\u670b\u53cb"
+                    realtimeNotice = FloatingRealtimeNotice(
+                        id = event.id,
+                        title = "\u65b0\u7684\u597d\u53cb\u7533\u8bf7",
+                        message = "$fromName \u60f3\u6dfb\u52a0\u4f60\u4e3a\u597d\u53cb",
+                        kind = RealtimeNoticeKind.Friend
+                    )
+                    refreshFriends()
+                }
+                "friend_request_accepted" -> {
+                    val fromName = event.payload.optJSONObject("fromUser")
+                        ?.optString("displayName")
+                        ?.takeIf { it.isNotBlank() }
+                        ?: "\u5bf9\u65b9"
+                    realtimeNotice = FloatingRealtimeNotice(
+                        id = event.id,
+                        title = "\u597d\u53cb\u7533\u8bf7\u5df2\u901a\u8fc7",
+                        message = "$fromName \u5df2\u6210\u4e3a\u4f60\u7684\u597d\u53cb",
+                        kind = RealtimeNoticeKind.Friend
+                    )
+                    refreshFriends()
+                }
+                "friend_request_rejected" -> {
+                    val fromName = event.payload.optJSONObject("fromUser")
+                        ?.optString("displayName")
+                        ?.takeIf { it.isNotBlank() }
+                        ?: "\u5bf9\u65b9"
+                    realtimeNotice = FloatingRealtimeNotice(
+                        id = event.id,
+                        title = "\u597d\u53cb\u7533\u8bf7\u88ab\u62d2\u7edd",
+                        message = "$fromName \u6ca1\u6709\u901a\u8fc7\u4f60\u7684\u597d\u53cb\u7533\u8bf7",
+                        kind = RealtimeNoticeKind.Friend
+                    )
+                    refreshFriends()
+                }
+                "friend_removed" -> {
+                    realtimeNotice = FloatingRealtimeNotice(
+                        id = event.id,
+                        title = "\u597d\u53cb\u72b6\u6001\u5df2\u66f4\u65b0",
+                        message = "\u597d\u53cb\u5217\u8868\u5df2\u540c\u6b65",
+                        kind = RealtimeNoticeKind.Neutral
+                    )
+                    refreshFriends()
+                    refreshMeetings()
+                }
+            }
+        }
+    }
 
     LaunchedEffect(session.accessToken, selectedFriendFilter?.userId) {
         refreshMeetings()
     }
     LaunchedEffect(session.accessToken) {
         refreshFriends()
+    }
+    LaunchedEffect(session.accessToken) {
+        try {
+            val existingEvents = withContext(Dispatchers.IO) {
+                authApiClient.getRealtimeEvents(session.accessToken, 0L)
+            }
+            lastRealtimeEventId = existingEvents.maxOfOrNull { it.id } ?: 0L
+        } catch (_: Exception) {
+            lastRealtimeEventId = 0L
+        }
+        realtimeReady = true
+        while (true) {
+            delay(2_000)
+            try {
+                val events = withContext(Dispatchers.IO) {
+                    authApiClient.getRealtimeEvents(session.accessToken, lastRealtimeEventId)
+                }
+                events.forEach { event ->
+                    handleRealtimeEvent(event)
+                }
+            } catch (_: Exception) {
+                // SSE may still be active. Keep polling quietly while the app is foreground.
+            }
+        }
+    }
+    DisposableEffect(session.accessToken) {
+        val connection = authApiClient.openRealtimeEvents(
+            accessToken = session.accessToken,
+            onEvent = { event ->
+                mainHandler.post {
+                    handleRealtimeEvent(event)
+                }
+            },
+            onError = {
+                // The connection retries in the background. Keep UI quiet unless a real event arrives.
+            }
+        )
+        onDispose {
+            connection.close()
+        }
+    }
+    LaunchedEffect(realtimeNotice?.id) {
+        if (realtimeNotice != null) {
+            val durationMs = if (realtimeNotice?.kind == RealtimeNoticeKind.Friend) 8_000L else 4_200L
+            delay(durationMs)
+            realtimeNotice = null
+        }
     }
     LaunchedEffect(isScanningTap, session.accessToken) {
         if (activity == null) {
@@ -1210,6 +1356,10 @@ private fun TouchHomeScreen(
                 onDismiss = { dayDetailTarget = null }
             )
         }
+        FloatingRealtimeNoticeOverlay(
+            notice = realtimeNotice,
+            onDismiss = { realtimeNotice = null }
+        )
     }
 }
 
@@ -1361,7 +1511,7 @@ private fun AccountPanel(
                         color = TouchColors.TextMuted
                     )
                 }
-                TextButton(onClick = onLogout) {
+                TextButton(onClick = onLogout, colors = touchDangerTextButtonColors()) {
                     Text(
                         text = "\u9000\u51fa",
                         color = TouchColors.Error,
@@ -1455,7 +1605,8 @@ private fun AccountEditInline(
                         scaleX = avatarButtonScale
                         scaleY = avatarButtonScale
                     },
-                shape = RoundedCornerShape(8.dp)
+                shape = RoundedCornerShape(8.dp),
+                colors = touchOutlinedButtonColors()
             ) {
                 Text("\u66f4\u6362\u5934\u50cf")
             }
@@ -1494,7 +1645,7 @@ private fun AccountEditInline(
                         scaleY = saveButtonScale
                     },
                 shape = RoundedCornerShape(8.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = TouchColors.Primary)
+                colors = touchPrimaryButtonColors()
             ) {
                 Text(if (isSaving) "\u5904\u7406\u4e2d..." else "\u4fdd\u5b58")
             }
@@ -1503,7 +1654,7 @@ private fun AccountEditInline(
             Text(
                 text = it,
                 style = MaterialTheme.typography.bodySmall,
-                color = if (it.contains("\u5931\u8d25") || it.contains("\u4e0d\u80fd")) {
+                color = if (it.contains("\u5931\u8d25") || it.contains("\u4e0d\u80fd") || it.contains("\u5360\u7528")) {
                     TouchColors.Error
                 } else {
                     TouchColors.TextMuted
@@ -1595,6 +1746,48 @@ private fun Modifier.cuteClickable(
 }
 
 @Composable
+private fun touchPrimaryButtonColors() = ButtonDefaults.buttonColors(
+    containerColor = TouchColors.Primary,
+    contentColor = Color.White,
+    disabledContainerColor = TouchColors.CalendarTile,
+    disabledContentColor = TouchColors.TextMuted
+)
+
+@Composable
+private fun touchSecondaryButtonColors() = ButtonDefaults.buttonColors(
+    containerColor = TouchColors.Secondary,
+    contentColor = Color.White,
+    disabledContainerColor = TouchColors.CalendarTile,
+    disabledContentColor = TouchColors.TextMuted
+)
+
+@Composable
+private fun touchDangerButtonColors() = ButtonDefaults.buttonColors(
+    containerColor = TouchColors.Error,
+    contentColor = Color.White,
+    disabledContainerColor = TouchColors.ErrorSoft,
+    disabledContentColor = TouchColors.TextMuted
+)
+
+@Composable
+private fun touchOutlinedButtonColors() = ButtonDefaults.outlinedButtonColors(
+    contentColor = TouchColors.PrimaryDark,
+    disabledContentColor = TouchColors.TextMuted
+)
+
+@Composable
+private fun touchDangerTextButtonColors() = ButtonDefaults.textButtonColors(
+    contentColor = TouchColors.Error,
+    disabledContentColor = TouchColors.TextMuted
+)
+
+@Composable
+private fun touchTextButtonColors() = ButtonDefaults.textButtonColors(
+    contentColor = TouchColors.PrimaryDark,
+    disabledContentColor = TouchColors.TextMuted
+)
+
+@Composable
 private fun Header(isReady: Boolean) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -1617,11 +1810,6 @@ private fun Header(isReady: Boolean) {
                 )
                 ReadinessPill(isReady = isReady)
             }
-            Text(
-                text = "\u5b89\u5168\u7684\u78b0\u4e00\u78b0\u89c1\u9762\u8bb0\u5f55",
-                style = MaterialTheme.typography.bodyMedium,
-                color = TouchColors.TextMuted
-            )
         }
     }
 }
@@ -1662,60 +1850,184 @@ private fun BottomTabBar(
     selectedTab: MainTab,
     onTabSelected: (MainTab) -> Unit
 ) {
-    Surface(
-        color = TouchColors.Surface,
-        tonalElevation = 2.dp,
-        shadowElevation = 6.dp
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(TouchColors.Background.copy(alpha = 0.94f))
+            .padding(horizontal = 18.dp, vertical = 10.dp)
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 18.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = TouchColors.Surface.copy(alpha = 0.96f),
+            shape = RoundedCornerShape(24.dp),
+            tonalElevation = 0.dp,
+            shadowElevation = 10.dp
         ) {
-            BottomTabItem(
-                label = "\u4e3b\u754c\u9762",
-                selected = selectedTab == MainTab.Home,
-                onClick = { onTabSelected(MainTab.Home) },
-                modifier = Modifier.weight(1f)
-            )
-            BottomTabItem(
-                label = "\u597d\u53cb",
-                selected = selectedTab == MainTab.Friends,
-                onClick = { onTabSelected(MainTab.Friends) },
-                modifier = Modifier.weight(1f)
-            )
-            BottomTabItem(
-                label = "\u6211\u7684",
-                selected = selectedTab == MainTab.Mine,
-                onClick = { onTabSelected(MainTab.Mine) },
-                modifier = Modifier.weight(1f)
-            )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(5.dp),
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                BottomTabItem(
+                    tab = MainTab.Home,
+                    label = "\u4e3b\u754c\u9762",
+                    selected = selectedTab == MainTab.Home,
+                    onClick = { onTabSelected(MainTab.Home) },
+                    modifier = Modifier.weight(1f)
+                )
+                BottomTabItem(
+                    tab = MainTab.Friends,
+                    label = "\u597d\u53cb",
+                    selected = selectedTab == MainTab.Friends,
+                    onClick = { onTabSelected(MainTab.Friends) },
+                    modifier = Modifier.weight(1f)
+                )
+                BottomTabItem(
+                    tab = MainTab.Mine,
+                    label = "\u6211\u7684",
+                    selected = selectedTab == MainTab.Mine,
+                    onClick = { onTabSelected(MainTab.Mine) },
+                    modifier = Modifier.weight(1f)
+                )
+            }
         }
     }
 }
 
 @Composable
 private fun BottomTabItem(
+    tab: MainTab,
     label: String,
     selected: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Surface(
+    val selectedProgress by animateFloatAsState(
+        targetValue = if (selected) 1f else 0f,
+        animationSpec = tween(180, easing = FastOutSlowInEasing),
+        label = "bottom-tab-selected"
+    )
+    val lift by animateFloatAsState(
+        targetValue = if (selected) -2f else 0f,
+        animationSpec = tween(180, easing = FastOutSlowInEasing),
+        label = "bottom-tab-lift"
+    )
+    val backgroundColor = if (selected) {
+        TouchColors.Primary.copy(alpha = 0.14f)
+    } else {
+        Color.Transparent
+    }
+    val iconColor = if (selected) TouchColors.PrimaryDark else TouchColors.TextMuted
+    val textColor = if (selected) TouchColors.PrimaryDark else TouchColors.TextMuted
+
+    Box(
         modifier = modifier
-            .height(42.dp)
-            .cuteClickable(onClick = onClick),
-        color = if (selected) TouchColors.SuccessSoft else TouchColors.CalendarTile,
-        shape = RoundedCornerShape(8.dp)
+            .height(54.dp)
+            .graphicsLayer { translationY = lift }
+            .clip(RoundedCornerShape(20.dp))
+            .background(backgroundColor)
+            .cuteClickable(onClick = onClick)
     ) {
-        Box(contentAlignment = Alignment.Center) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(top = 7.dp, bottom = 5.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            BottomTabGlyph(
+                tab = tab,
+                selected = selected,
+                tint = iconColor
+            )
             Text(
                 text = label,
-                style = MaterialTheme.typography.labelLarge,
-                color = if (selected) TouchColors.PrimaryDark else TouchColors.TextMuted,
-                fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold
+                style = MaterialTheme.typography.labelMedium,
+                color = textColor,
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Clip
             )
+        }
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .width((12 + 18 * selectedProgress).dp)
+                .height(3.dp)
+                .clip(RoundedCornerShape(50))
+                .background(TouchColors.Accent.copy(alpha = 0.28f + 0.62f * selectedProgress))
+        )
+    }
+}
+
+@Composable
+private fun BottomTabGlyph(
+    tab: MainTab,
+    selected: Boolean,
+    tint: Color
+) {
+    val pulse by animateFloatAsState(
+        targetValue = if (selected) 1f else 0f,
+        animationSpec = tween(180, easing = FastOutSlowInEasing),
+        label = "bottom-tab-glyph"
+    )
+    Canvas(modifier = Modifier.size(21.dp)) {
+        val stroke = Stroke(width = 2.1.dp.toPx())
+        val softTint = tint.copy(alpha = 0.32f + 0.28f * pulse)
+        when (tab) {
+            MainTab.Home -> {
+                drawRoundRect(
+                    color = softTint,
+                    topLeft = Offset(size.width * 0.2f, size.height * 0.3f),
+                    size = androidx.compose.ui.geometry.Size(size.width * 0.6f, size.height * 0.52f),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(5.dp.toPx(), 5.dp.toPx()),
+                    style = stroke
+                )
+                drawLine(
+                    color = tint,
+                    start = Offset(size.width * 0.22f, size.height * 0.42f),
+                    end = Offset(size.width * 0.5f, size.height * 0.17f),
+                    strokeWidth = 2.1.dp.toPx()
+                )
+                drawLine(
+                    color = tint,
+                    start = Offset(size.width * 0.5f, size.height * 0.17f),
+                    end = Offset(size.width * 0.78f, size.height * 0.42f),
+                    strokeWidth = 2.1.dp.toPx()
+                )
+            }
+            MainTab.Friends -> {
+                drawCircle(
+                    color = tint,
+                    radius = size.minDimension * 0.16f,
+                    center = Offset(size.width * 0.38f, size.height * 0.36f)
+                )
+                drawCircle(
+                    color = softTint,
+                    radius = size.minDimension * 0.13f,
+                    center = Offset(size.width * 0.65f, size.height * 0.42f)
+                )
+                drawRoundRect(
+                    color = tint.copy(alpha = 0.82f),
+                    topLeft = Offset(size.width * 0.18f, size.height * 0.62f),
+                    size = androidx.compose.ui.geometry.Size(size.width * 0.58f, size.height * 0.16f),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(18.dp.toPx(), 18.dp.toPx())
+                )
+            }
+            MainTab.Mine -> {
+                drawCircle(
+                    color = tint,
+                    radius = size.minDimension * 0.16f,
+                    center = Offset(size.width * 0.5f, size.height * 0.34f)
+                )
+                drawRoundRect(
+                    color = softTint,
+                    topLeft = Offset(size.width * 0.24f, size.height * 0.6f),
+                    size = androidx.compose.ui.geometry.Size(size.width * 0.52f, size.height * 0.18f),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(18.dp.toPx(), 18.dp.toPx())
+                )
+            }
         }
     }
 }
@@ -1783,6 +2095,9 @@ private fun FriendManagementScreen(
     var statusText by remember { mutableStateOf<String?>(errorText) }
     var isBusy by remember { mutableStateOf(false) }
     var friendPendingRemove by remember { mutableStateOf<Friendship?>(null) }
+    val primaryButtonColors = touchPrimaryButtonColors()
+    val outlineButtonColors = touchOutlinedButtonColors()
+    val dangerTextButtonColors = touchDangerTextButtonColors()
     val accepted = friendships
         .filter { it.status == "accepted" && it.friend != null }
         .sortedWith(
@@ -1840,7 +2155,7 @@ private fun FriendManagementScreen(
                     )
                 }
                 if (showBackButton) {
-                    TextButton(onClick = onBack) {
+                    TextButton(onClick = onBack, colors = touchTextButtonColors()) {
                         Text("\u8fd4\u56de", color = TouchColors.Primary, fontWeight = FontWeight.SemiBold)
                     }
                 }
@@ -1899,7 +2214,7 @@ private fun FriendManagementScreen(
                             },
                             enabled = !isBusy,
                             shape = RoundedCornerShape(8.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = TouchColors.Primary)
+                            colors = primaryButtonColors
                         ) {
                             Text("\u641c\u7d22")
                         }
@@ -1911,12 +2226,28 @@ private fun FriendManagementScreen(
                             trailing = {
                                 OutlinedButton(
                                     onClick = {
-                                        runFriendAction {
-                                            authApiClient.sendFriendRequest(session.accessToken, user.userId)
-                                        }
+                                        isBusy = true
+                                        Thread {
+                                            try {
+                                                authApiClient.sendFriendRequest(session.accessToken, user.userId)
+                                                mainHandler.post {
+                                                    isBusy = false
+                                                    searchResults = emptyList()
+                                                    searchText = ""
+                                                    statusText = "\u5df2\u53d1\u9001\u597d\u53cb\u7533\u8bf7"
+                                                    onFriendshipsChanged(friendships)
+                                                }
+                                            } catch (error: Exception) {
+                                                mainHandler.post {
+                                                    isBusy = false
+                                                    statusText = error.message ?: "\u597d\u53cb\u7533\u8bf7\u53d1\u9001\u5931\u8d25"
+                                                }
+                                            }
+                                        }.start()
                                     },
                                     enabled = !isBusy,
-                                    shape = RoundedCornerShape(8.dp)
+                                    shape = RoundedCornerShape(8.dp),
+                                    colors = outlineButtonColors
                                 ) {
                                     Text("\u7533\u8bf7")
                                 }
@@ -1956,7 +2287,8 @@ private fun FriendManagementScreen(
                                             }
                                         },
                                         enabled = !isBusy,
-                                        shape = RoundedCornerShape(8.dp)
+                                        shape = RoundedCornerShape(8.dp),
+                                        colors = outlineButtonColors
                                     ) {
                                         Text("\u62d2\u7edd")
                                     }
@@ -1968,7 +2300,7 @@ private fun FriendManagementScreen(
                                         },
                                         enabled = !isBusy,
                                         shape = RoundedCornerShape(8.dp),
-                                        colors = ButtonDefaults.buttonColors(containerColor = TouchColors.Primary)
+                                        colors = primaryButtonColors
                                     ) {
                                         Text("\u63a5\u53d7")
                                     }
@@ -2005,15 +2337,17 @@ private fun FriendManagementScreen(
                                             }
                                         },
                                         enabled = !isBusy,
-                                        shape = RoundedCornerShape(8.dp)
+                                        shape = RoundedCornerShape(8.dp),
+                                        colors = outlineButtonColors
                                     ) {
                                         Text(if (friendship.blockedByMe) "\u53d6\u6d88\u5c4f\u853d" else "\u5c4f\u853d")
                                     }
                                     TextButton(
                                         onClick = { friendPendingRemove = friendship },
-                                        enabled = !isBusy
+                                        enabled = !isBusy,
+                                        colors = dangerTextButtonColors
                                     ) {
-                                        Text("\u5220\u9664", color = TouchColors.Error)
+                                        Text("\u5220\u9664")
                                     }
                                 }
                             }
@@ -2128,7 +2462,8 @@ private fun ConfirmRemoveFriendDialog(
                         onClick = onCancel,
                         enabled = !isBusy,
                         modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(8.dp)
+                        shape = RoundedCornerShape(8.dp),
+                        colors = touchOutlinedButtonColors()
                     ) {
                         Text("\u53d6\u6d88")
                     }
@@ -2137,7 +2472,7 @@ private fun ConfirmRemoveFriendDialog(
                         enabled = !isBusy,
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(8.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = TouchColors.Error)
+                        colors = touchDangerButtonColors()
                     ) {
                         Text(if (isBusy) "\u5220\u9664\u4e2d..." else "\u786e\u8ba4\u5220\u9664")
                     }
@@ -2267,7 +2602,8 @@ private fun FriendCardDialog(
                     OutlinedButton(
                         onClick = onDismiss,
                         modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(8.dp)
+                        shape = RoundedCornerShape(8.dp),
+                        colors = touchOutlinedButtonColors()
                     ) {
                         Text("\u5173\u95ed")
                     }
@@ -2293,7 +2629,7 @@ private fun FriendCardDialog(
                         enabled = !isSaving,
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(8.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = TouchColors.Primary)
+                        colors = touchPrimaryButtonColors()
                     ) {
                         Text(if (isSaving) "\u4fdd\u5b58\u4e2d..." else "\u4fdd\u5b58")
                     }
@@ -2440,7 +2776,10 @@ private fun MeetingCalendar(
 
     Card(
         modifier = Modifier
-            .fillMaxWidth(),
+            .fillMaxWidth()
+            .animateContentSize(
+                animationSpec = tween(CALENDAR_SIZE_ANIMATION_MS, easing = FastOutSlowInEasing)
+            ),
         colors = CardDefaults.cardColors(containerColor = TouchColors.Surface),
         shape = RoundedCornerShape(8.dp),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
@@ -2519,7 +2858,53 @@ private fun MeetingCalendar(
             var isDraggingCalendar by remember(viewMode, focusedYear, focusedMonth, calendarMeetings.firstOrNull()?.date) {
                 mutableStateOf(false)
             }
+            var rangeSwitchDirection by remember { mutableIntStateOf(0) }
+            val rangeSwitchOffset = remember { Animatable(0f) }
+            val modeTransitionAlpha = remember { Animatable(1f) }
+            val modeTransitionScale = remember { Animatable(1f) }
+            val modeTransitionOffset = remember { Animatable(0f) }
             val swipeThreshold = with(LocalDensity.current) { 72.dp.toPx() }
+            val rangeSnapOffset = with(LocalDensity.current) { 20.dp.toPx() }
+            val modeSnapOffset = with(LocalDensity.current) { 10.dp.toPx() }
+            LaunchedEffect(viewMode) {
+                modeTransitionAlpha.snapTo(0.86f)
+                modeTransitionScale.snapTo(0.994f)
+                modeTransitionOffset.snapTo(modeSnapOffset * 0.55f)
+                coroutineScope {
+                    launch {
+                        modeTransitionAlpha.animateTo(
+                            targetValue = 1f,
+                            animationSpec = tween(CALENDAR_CONTENT_ANIMATION_MS, easing = FastOutSlowInEasing)
+                        )
+                    }
+                    launch {
+                        modeTransitionScale.animateTo(
+                            targetValue = 1f,
+                            animationSpec = tween(CALENDAR_CONTENT_ANIMATION_MS, easing = FastOutSlowInEasing)
+                        )
+                    }
+                    launch {
+                        modeTransitionOffset.animateTo(
+                            targetValue = 0f,
+                            animationSpec = tween(CALENDAR_CONTENT_ANIMATION_MS, easing = FastOutSlowInEasing)
+                        )
+                    }
+                }
+            }
+            LaunchedEffect(viewMode, focusedYear, focusedMonth, calendarMeetings.firstOrNull()?.date) {
+                if (rangeSwitchDirection != 0) {
+                    rangeSwitchOffset.snapTo(-rangeSwitchDirection * rangeSnapOffset)
+                    rangeSwitchOffset.animateTo(
+                        targetValue = rangeSwitchDirection * 3.5f,
+                        animationSpec = tween(220, easing = FastOutSlowInEasing)
+                    )
+                    rangeSwitchOffset.animateTo(
+                        targetValue = 0f,
+                        animationSpec = tween(160, easing = FastOutSlowInEasing)
+                    )
+                    rangeSwitchDirection = 0
+                }
+            }
             val visualDragOffset by animateFloatAsState(
                 targetValue = if (isDraggingCalendar) {
                     dragOffset.coerceIn(-swipeThreshold, swipeThreshold) * 0.32f
@@ -2544,8 +2929,14 @@ private fun MeetingCalendar(
                             },
                             onDragEnd = {
                                 when {
-                                    dragOffset <= -swipeThreshold -> onRangeSwipe(1)
-                                    dragOffset >= swipeThreshold -> onRangeSwipe(-1)
+                                    dragOffset <= -swipeThreshold -> {
+                                        rangeSwitchDirection = 1
+                                        onRangeSwipe(1)
+                                    }
+                                    dragOffset >= swipeThreshold -> {
+                                        rangeSwitchDirection = -1
+                                        onRangeSwipe(-1)
+                                    }
                                 }
                                 dragOffset = 0f
                                 isDraggingCalendar = false
@@ -2558,20 +2949,20 @@ private fun MeetingCalendar(
                     }
                 }
             ) {
-                Crossfade(
-                    targetState = CalendarRenderKey(
-                        mode = viewMode,
-                        year = focusedYear,
-                        month = focusedMonth,
-                        weekStartDate = calendarMeetings.firstOrNull()?.date
-                    ),
-                    animationSpec = tween(SWITCH_ANIMATION_MS, easing = FastOutSlowInEasing),
-                    label = "calendar-view-mode",
-                    modifier = Modifier.graphicsLayer {
-                        translationX = visualDragOffset
-                    }
-                ) { renderKey ->
-                    when (renderKey.mode) {
+                Box(
+                    modifier = Modifier
+                        .animateContentSize(
+                            animationSpec = tween(CALENDAR_SIZE_ANIMATION_MS, easing = FastOutSlowInEasing)
+                        )
+                        .graphicsLayer {
+                            translationX = if (isDraggingCalendar) visualDragOffset else rangeSwitchOffset.value
+                            translationY = modeTransitionOffset.value
+                            alpha = modeTransitionAlpha.value
+                            scaleX = modeTransitionScale.value
+                            scaleY = modeTransitionScale.value
+                        }
+                ) {
+                    when (viewMode) {
                         CalendarViewMode.Week -> WeekCalendarView(
                             calendarMeetings = calendarMeetings,
                             onDaySelected = onDaySelected,
@@ -2657,23 +3048,46 @@ private fun WeekCalendarView(
     var edgeDragOffset by remember(calendarMeetings.firstOrNull()?.date) { mutableStateOf(0f) }
     var isDraggingEdge by remember(calendarMeetings.firstOrNull()?.date) { mutableStateOf(false) }
     var edgeSwitchLocked by remember { mutableStateOf(false) }
-    var shouldReboundAfterSwitch by remember { mutableStateOf(false) }
-    val swipeThreshold = with(LocalDensity.current) { 148.dp.toPx() }
+    var reboundDirection by remember { mutableIntStateOf(0) }
+    var reboundToken by remember { mutableIntStateOf(0) }
+    val swipeThreshold = with(LocalDensity.current) { 118.dp.toPx() }
+    val reboundVisualOffset = remember { Animatable(0f) }
+    val reboundStartOffset = with(LocalDensity.current) { 34.dp.toPx() }
     suspend fun reboundToWeekCenter() {
         if (scrollState.maxValue > 0) {
-            scrollState.animateScrollTo(
-                value = scrollState.maxValue / 2,
-                animationSpec = tween(REBOUND_ANIMATION_MS, easing = FastOutSlowInEasing)
-            )
+            val center = scrollState.maxValue / 2
+            scrollState.scrollTo(center)
         }
+        reboundVisualOffset.snapTo(-reboundDirection * reboundStartOffset)
+        reboundVisualOffset.animateTo(
+            targetValue = reboundDirection * 7f,
+            animationSpec = tween(REBOUND_ANIMATION_MS, easing = FastOutSlowInEasing)
+        )
+        reboundVisualOffset.animateTo(
+            targetValue = 0f,
+            animationSpec = tween(170, easing = FastOutSlowInEasing)
+        )
     }
-    LaunchedEffect(calendarMeetings.firstOrNull()?.date, scrollState.maxValue) {
-        if (shouldReboundAfterSwitch) {
+    LaunchedEffect(calendarMeetings.firstOrNull()?.date, scrollState.maxValue, reboundToken) {
+        if (reboundToken > 0) {
+            delay(80)
             reboundToWeekCenter()
-            shouldReboundAfterSwitch = false
+            delay(120)
+            edgeDragOffset = 0f
+            isDraggingEdge = false
+            edgeSwitchLocked = false
+            reboundDirection = 0
+        } else if (scrollState.maxValue > 0 && scrollState.value == 0) {
+            scrollState.scrollTo(scrollState.maxValue / 2)
         }
     }
-    val edgeNestedScrollConnection = remember(swipeThreshold) {
+    val edgeNestedScrollConnection = remember(
+        swipeThreshold,
+        scrollState,
+        edgeSwitchLocked,
+        edgeDragOffset,
+        reboundToken
+    ) {
         object : NestedScrollConnection {
             override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
                 if (source != NestedScrollSource.UserInput || edgeSwitchLocked) {
@@ -2700,14 +3114,16 @@ private fun WeekCalendarView(
                         edgeDragOffset = 0f
                         isDraggingEdge = false
                         edgeSwitchLocked = true
-                        shouldReboundAfterSwitch = true
+                        reboundDirection = -1
+                        reboundToken += 1
                         onRangeSwipe(-1)
                     }
                     edgeDragOffset <= -swipeThreshold -> {
                         edgeDragOffset = 0f
                         isDraggingEdge = false
                         edgeSwitchLocked = true
-                        shouldReboundAfterSwitch = true
+                        reboundDirection = 1
+                        reboundToken += 1
                         onRangeSwipe(1)
                     }
                 }
@@ -2717,14 +3133,18 @@ private fun WeekCalendarView(
             override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
                 edgeDragOffset = 0f
                 isDraggingEdge = false
-                edgeSwitchLocked = false
+                if (!edgeSwitchLocked) {
+                    edgeSwitchLocked = false
+                }
                 return Velocity.Zero
             }
 
             override suspend fun onPreFling(available: Velocity): Velocity {
                 edgeDragOffset = 0f
                 isDraggingEdge = false
-                edgeSwitchLocked = false
+                if (!edgeSwitchLocked) {
+                    edgeSwitchLocked = false
+                }
                 return Velocity.Zero
             }
         }
@@ -2743,8 +3163,9 @@ private fun WeekCalendarView(
             .fillMaxWidth()
             .nestedScroll(edgeNestedScrollConnection)
             .horizontalScroll(scrollState)
+            .padding(bottom = 5.dp)
             .graphicsLayer {
-                translationX = visualEdgeOffset
+                translationX = visualEdgeOffset + reboundVisualOffset.value
             },
         horizontalArrangement = Arrangement.spacedBy(10.dp)
     ) {
@@ -2921,7 +3342,11 @@ private fun YearMonthCell(
                 fontWeight = FontWeight.Bold
             )
             Text(
-                text = if (peopleCount > 0 && !isFriendFiltered) "${peopleCount}\u4eba" else if (peopleCount > 0) "" else "\u65e0",
+                text = when {
+                    peopleCount <= 0 -> "\u65e0"
+                    isFriendFiltered -> "${peopleCount}\u6b21"
+                    else -> "${peopleCount}\u4eba"
+                },
                 style = MaterialTheme.typography.labelSmall,
                 color = if (peopleCount > 0) TouchColors.HeatText else TouchColors.TextMuted,
                 fontWeight = FontWeight.Medium
@@ -3006,6 +3431,7 @@ private fun DayDetailDialog(
     var statusText by remember { mutableStateOf<String?>(null) }
     var isSaving by remember { mutableStateOf(false) }
     var isEventsLoading by remember { mutableStateOf(true) }
+    var canHideEventsLoading by remember { mutableStateOf(false) }
     var selectedEvent by remember { mutableStateOf<DayEvent?>(null) }
     var eventActionTarget by remember { mutableStateOf<DayEvent?>(null) }
     var eventEditing by remember { mutableStateOf<DayEvent?>(null) }
@@ -3036,6 +3462,11 @@ private fun DayDetailDialog(
 
     LaunchedEffect(eventDate) {
         isEventsLoading = true
+        canHideEventsLoading = false
+        launch {
+            delay(650)
+            canHideEventsLoading = true
+        }
         Thread {
             val loaded = runCatching { authApiClient.getDayEvents(accessToken, eventDate).map { it.toDayEvent() } }
             mainHandler.post {
@@ -3075,9 +3506,16 @@ private fun DayDetailDialog(
                         }
                     }
                 }
-                if (isEventsLoading) {
+                AnimatedVisibility(
+                    visible = isEventsLoading || !canHideEventsLoading,
+                    enter = fadeIn(tween(120, easing = FastOutSlowInEasing)) +
+                        slideInVertically(tween(120, easing = FastOutSlowInEasing)) { -it / 18 },
+                    exit = fadeOut(tween(180, easing = FastOutSlowInEasing)) +
+                        slideOutVertically(tween(180, easing = FastOutSlowInEasing)) { -it / 12 }
+                ) {
                     LoadingWaveHint(text = "\u6b63\u5728\u52a0\u8f7d\u5df2\u8bb0\u5f55\u7684\u4e8b...")
-                } else if (events.isNotEmpty()) {
+                }
+                if (!isEventsLoading && canHideEventsLoading && events.isNotEmpty()) {
                     Text(
                         text = "\u5df2\u8bb0\u5f55\u7684\u4e8b",
                         style = MaterialTheme.typography.titleSmall,
@@ -3150,7 +3588,8 @@ private fun DayDetailDialog(
                     OutlinedButton(
                         onClick = { imagePicker.launch("image/*") },
                         modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(8.dp)
+                        shape = RoundedCornerShape(8.dp),
+                        colors = touchOutlinedButtonColors()
                     ) {
                         Text(if (imageBase64List.isEmpty()) "\u4e0a\u4f20\u56fe\u7247" else "\u7ee7\u7eed\u6dfb\u52a0")
                     }
@@ -3186,7 +3625,7 @@ private fun DayDetailDialog(
                         enabled = !isSaving,
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(8.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = TouchColors.Primary)
+                        colors = touchPrimaryButtonColors()
                     ) {
                         Text(if (isSaving) "\u4fdd\u5b58\u4e2d..." else "\u4fdd\u5b58")
                     }
@@ -3201,7 +3640,8 @@ private fun DayDetailDialog(
                 OutlinedButton(
                     onClick = onDismiss,
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(8.dp)
+                    shape = RoundedCornerShape(8.dp),
+                    colors = touchOutlinedButtonColors()
                 ) {
                     Text("\u5173\u95ed")
                 }
@@ -3365,15 +3805,16 @@ private fun EventActionDialog(
                     OutlinedButton(
                         onClick = onDelete,
                         modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(8.dp)
+                        shape = RoundedCornerShape(8.dp),
+                        colors = touchDangerTextButtonColors()
                     ) {
-                        Text("\u5220\u9664", color = TouchColors.Error)
+                        Text("\u5220\u9664")
                     }
                     Button(
                         onClick = onEdit,
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(8.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = TouchColors.Primary)
+                        colors = touchPrimaryButtonColors()
                     ) {
                         Text("\u7f16\u8f91")
                     }
@@ -3445,7 +3886,12 @@ private fun EventEditDialog(
                     }
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedButton(onClick = { imagePicker.launch("image/*") }, modifier = Modifier.weight(1f), shape = RoundedCornerShape(8.dp)) {
+                    OutlinedButton(
+                        onClick = { imagePicker.launch("image/*") },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(8.dp),
+                        colors = touchOutlinedButtonColors()
+                    ) {
                         Text("\u6dfb\u52a0\u56fe\u7247")
                     }
                     Button(
@@ -3476,7 +3922,7 @@ private fun EventEditDialog(
                         enabled = !isSaving,
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(8.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = TouchColors.Primary)
+                        colors = touchPrimaryButtonColors()
                     ) {
                         Text(if (isSaving) "\u4fdd\u5b58\u4e2d..." else "\u4fdd\u5b58")
                     }
@@ -3667,7 +4113,8 @@ private fun EventDetailDialog(event: DayEvent, onDismiss: () -> Unit) {
                 OutlinedButton(
                     onClick = onDismiss,
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(8.dp)
+                    shape = RoundedCornerShape(8.dp),
+                    colors = touchOutlinedButtonColors()
                 ) {
                     Text("\u5173\u95ed")
                 }
@@ -3773,7 +4220,7 @@ private fun ImageGalleryDialog(
                         color = TouchColors.TextStrong,
                         fontWeight = FontWeight.Bold
                     )
-                    TextButton(onClick = onDismiss) {
+                    TextButton(onClick = onDismiss, colors = touchTextButtonColors()) {
                         Text("\u5173\u95ed")
                     }
                 }
@@ -3882,7 +4329,8 @@ private fun ConfirmDeleteEventDialog(
                         onClick = onCancel,
                         enabled = !isDeleting,
                         modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(8.dp)
+                        shape = RoundedCornerShape(8.dp),
+                        colors = touchOutlinedButtonColors()
                     ) {
                         Text("\u53d6\u6d88")
                     }
@@ -3891,7 +4339,7 @@ private fun ConfirmDeleteEventDialog(
                         enabled = !isDeleting,
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(8.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = TouchColors.Error)
+                        colors = touchDangerButtonColors()
                     ) {
                         Text(if (isDeleting) "\u5220\u9664\u4e2d..." else "\u5220\u9664")
                     }
@@ -4244,6 +4692,123 @@ private fun CalendarDayCard(
 }
 
 @Composable
+private fun FloatingRealtimeNoticeOverlay(
+    notice: FloatingRealtimeNotice?,
+    onDismiss: () -> Unit
+) {
+    var displayedNotice by remember { mutableStateOf<FloatingRealtimeNotice?>(null) }
+    LaunchedEffect(notice) {
+        if (notice != null) {
+            displayedNotice = notice
+        } else {
+            delay(180)
+            displayedNotice = null
+        }
+    }
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 18.dp, vertical = 34.dp),
+        contentAlignment = Alignment.TopCenter
+    ) {
+        AnimatedVisibility(
+            visible = notice != null,
+            enter = fadeIn(tween(130, easing = FastOutSlowInEasing)) +
+                slideInVertically(tween(170, easing = FastOutSlowInEasing)) { -it / 2 } +
+                scaleIn(tween(170, easing = FastOutSlowInEasing), initialScale = 0.96f),
+            exit = fadeOut(tween(120, easing = FastOutSlowInEasing)) +
+                slideOutVertically(tween(140, easing = FastOutSlowInEasing)) { -it / 3 }
+        ) {
+            val current = displayedNotice ?: return@AnimatedVisibility
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onDismiss),
+                colors = CardDefaults.cardColors(
+                    containerColor = TouchColors.Surface.copy(alpha = 0.96f)
+                ),
+                shape = RoundedCornerShape(8.dp),
+                elevation = CardDefaults.cardElevation(defaultElevation = 10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    RealtimeNoticePulse(
+                        kind = current.kind,
+                        modifier = Modifier.size(48.dp)
+                    )
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(3.dp)
+                    ) {
+                        Text(
+                            text = current.title,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = TouchColors.TextStrong,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = current.message,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TouchColors.TextMuted,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RealtimeNoticePulse(
+    kind: RealtimeNoticeKind,
+    modifier: Modifier = Modifier
+) {
+    val transition = rememberInfiniteTransition(label = "realtime-notice-pulse")
+    val progress by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1350, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "realtime-notice-progress"
+    )
+    val color = when (kind) {
+        RealtimeNoticeKind.Meeting -> TouchColors.Primary
+        RealtimeNoticeKind.Friend -> TouchColors.Accent
+        RealtimeNoticeKind.Neutral -> TouchColors.Secondary
+    }
+    Canvas(modifier = modifier) {
+        repeat(3) { index ->
+            val phase = (progress + index * 0.33f) % 1f
+            drawCircle(
+                color = color.copy(alpha = (1f - phase) * 0.18f),
+                radius = size.minDimension * (0.2f + phase * 0.34f),
+                center = center,
+                style = Stroke(width = size.minDimension * 0.035f)
+            )
+        }
+        drawCircle(
+            color = color.copy(alpha = 0.16f),
+            radius = size.minDimension * 0.32f,
+            center = center
+        )
+        drawCircle(
+            color = color,
+            radius = size.minDimension * 0.16f,
+            center = center
+        )
+    }
+}
+
+@Composable
 private fun TapProgressDialog(
     mode: TapDialogMode,
     statusText: String,
@@ -4327,7 +4892,7 @@ private fun TapProgressDialog(
                                     onClick = { onSendFriendRequest(pendingFriendPrompt.user) },
                                     modifier = Modifier.fillMaxWidth(),
                                     shape = RoundedCornerShape(8.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = TouchColors.Primary)
+                                    colors = touchPrimaryButtonColors()
                                 ) {
                                     Text("\u53d1\u9001\u597d\u53cb\u7533\u8bf7")
                                 }
@@ -4338,7 +4903,7 @@ private fun TapProgressDialog(
                         onClick = onDismiss,
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(8.dp),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = TouchColors.Primary)
+                        colors = touchOutlinedButtonColors()
                     ) {
                         Text(
                             text = when (mode) {
@@ -4465,7 +5030,7 @@ private fun PrimaryActions(
             },
             shape = RoundedCornerShape(8.dp),
             elevation = ButtonDefaults.buttonElevation(defaultElevation = 5.dp, pressedElevation = 1.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = TouchColors.Primary)
+            colors = touchPrimaryButtonColors()
         ) {
             Text(
                 text = if (isPreparing) "\u6b63\u5728\u51c6\u5907..." else "\u663e\u793a\u6211\u7684\u78b0\u4e00\u78b0",
@@ -4486,10 +5051,7 @@ private fun PrimaryActions(
             },
             shape = RoundedCornerShape(8.dp),
             elevation = ButtonDefaults.buttonElevation(defaultElevation = 5.dp, pressedElevation = 1.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = TouchColors.Secondary,
-                contentColor = Color.White
-            )
+            colors = touchSecondaryButtonColors()
         ) {
             Text(
                 text = if (isScanning) "\u505c\u6b62\u626b\u63cf" else "\u78b0\u4e00\u78b0\u522b\u4eba",
