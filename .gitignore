@@ -1,0 +1,40 @@
+# Android / Gradle
+.gradle/
+build/
+*/build/
+local.properties
+*.apk
+*.aab
+
+# Android Studio
+.idea/
+*.iml
+
+# Kotlin / Java
+*.class
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Backend local runtime data
+TouchBackend/data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Secrets / local environment
+.env
+.env.*
+*.keystore
+*.jks
+*.p12
+*.pem
+*.key
+
+# OS files
+.DS_Store
+Thumbs.db
