@@ -800,7 +800,7 @@ private fun TouchHomeScreen(
             try {
                 val loaded = authApiClient.getMeetings(
                     accessToken = session.accessToken,
-                    friendUserId = selectedFriendFilter?.userId
+                    friendUserId = null
                 ).map { it.toMeetingRecord() }
                 mainHandler.post {
                     meetingRecords = loaded
@@ -1117,10 +1117,40 @@ private fun TouchHomeScreen(
                             isFriendFiltered = selectedFriendFilter != null,
                             onFriendFilterChanged = {
                                 selectedFriendFilter = it
-                                detail = null
-                                selectedDetailDate = null
+                                val filteredRecords = if (it == null) {
+                                    meetingRecords
+                                } else {
+                                    meetingRecords.filter { record -> record.personUserId == it.userId }
+                                }
+                                detail = when {
+                                    calendarViewMode == CalendarViewMode.Week -> {
+                                        val weekMeetings = buildWeekMeetings(
+                                            records = filteredRecords,
+                                            year = focusedYear,
+                                            month = focusedMonth,
+                                            startDay = focusedWeekStartDay
+                                        )
+                                        CalendarDetail(
+                                            mode = CalendarDetailMode.Week,
+                                            date = weekMeetings.firstOrNull()?.date,
+                                            title = weekRangeLabel(weekMeetings),
+                                            records = weekMeetings.flatMap { meeting -> meeting.records }
+                                        )
+                                    }
+                                    detail?.mode == CalendarDetailMode.Day && selectedDetailDate != null -> {
+                                        val date = selectedDetailDate ?: ""
+                                        CalendarDetail(
+                                            mode = CalendarDetailMode.Day,
+                                            date = date,
+                                            title = "${formatDateLabel(date)} \u89c1\u9762\u8be6\u60c5",
+                                            records = filteredRecords.filter { record -> record.metDate == date }
+                                        )
+                                    }
+                                    else -> detail
+                                }
                             },
                             onRangeSwipe = { direction ->
+                                var nextWeekDetail: CalendarDetail? = null
                                 when (calendarViewMode) {
                                     CalendarViewMode.Week -> {
                                         val nextFocus = shiftWeekFocus(
@@ -1132,6 +1162,18 @@ private fun TouchHomeScreen(
                                         focusedYear = nextFocus.year
                                         focusedMonth = nextFocus.month
                                         focusedWeekStartDay = nextFocus.startDay
+                                        val weekMeetings = buildWeekMeetings(
+                                            records = visibleMeetingRecords,
+                                            year = nextFocus.year,
+                                            month = nextFocus.month,
+                                            startDay = nextFocus.startDay
+                                        )
+                                        nextWeekDetail = CalendarDetail(
+                                            mode = CalendarDetailMode.Week,
+                                            date = weekMeetings.firstOrNull()?.date,
+                                            title = weekRangeLabel(weekMeetings),
+                                            records = weekMeetings.flatMap { it.records }
+                                        )
                                     }
                                     CalendarViewMode.Month -> {
                                         val nextMonth = focusedMonth + direction
@@ -1154,13 +1196,22 @@ private fun TouchHomeScreen(
                                         focusedWeekStartDay = 1
                                     }
                                 }
-                                detail = null
+                                detail = nextWeekDetail
                                 selectedDetailDate = null
                             },
                             onViewModeChange = {
                                 calendarViewMode = it
-                                detail = null
                                 selectedDetailDate = null
+                                detail = if (it == CalendarViewMode.Week) {
+                                    CalendarDetail(
+                                        mode = CalendarDetailMode.Week,
+                                        date = calendarMeetings.firstOrNull()?.date,
+                                        title = weekRangeLabel(calendarMeetings),
+                                        records = calendarMeetings.flatMap { meeting -> meeting.records }
+                                    )
+                                } else {
+                                    null
+                                }
                             },
                             onClearDetail = {
                                 detail = null
@@ -3116,26 +3167,28 @@ private fun FriendStatPill(label: String, count: Int, modifier: Modifier = Modif
 private fun FriendFilterRow(
     friends: List<FriendUser>,
     selectedFriend: FriendUser?,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
     onFriendFilterChanged: (FriendUser?) -> Unit
 ) {
-    var expanded by remember { mutableStateOf(false) }
     Column(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.width(168.dp),
         horizontalAlignment = Alignment.End,
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Text(
             text = selectedFriend?.displayName ?: "\u5168\u90e8",
-            modifier = Modifier.cuteClickable { expanded = !expanded },
+            modifier = Modifier.cuteClickable { onExpandedChange(!expanded) },
             style = MaterialTheme.typography.labelMedium,
             color = TouchColors.TextMuted,
             fontWeight = FontWeight.SemiBold
         )
         AnimatedVisibility(
             visible = expanded,
-            enter = fadeIn(tween(INLINE_ENTER_MS, easing = FastOutSlowInEasing)) +
-                slideInVertically(tween(INLINE_ENTER_MS, easing = FastOutSlowInEasing)) { -it / 18 },
-            exit = fadeOut(tween(INLINE_EXIT_MS, easing = FastOutSlowInEasing))
+            enter = fadeIn(tween(150, easing = FastOutSlowInEasing)) +
+                slideInVertically(tween(150, easing = FastOutSlowInEasing)) { -it / 18 },
+            exit = fadeOut(tween(260, easing = FastOutSlowInEasing)) +
+                slideOutVertically(tween(260, easing = FastOutSlowInEasing)) { -it / 20 }
         ) {
             Surface(
                 color = TouchColors.DetailSurface,
@@ -3153,7 +3206,6 @@ private fun FriendFilterRow(
                         selected = selectedFriend == null,
                         onClick = {
                             onFriendFilterChanged(null)
-                            expanded = false
                         }
                     )
                     friends.forEach { friend ->
@@ -3162,7 +3214,6 @@ private fun FriendFilterRow(
                             selected = selectedFriend?.userId == friend.userId,
                             onClick = {
                                 onFriendFilterChanged(friend)
-                                expanded = false
                             }
                         )
                     }
@@ -3221,6 +3272,12 @@ private fun MeetingCalendar(
     val yearMeetings by remember(allRecords, focusedYear) {
         derivedStateOf { buildYearMeetings(allRecords, focusedYear) }
     }
+    var friendFilterExpanded by remember { mutableStateOf(false) }
+    val collapseFriendFilter = {
+        if (friendFilterExpanded) {
+            friendFilterExpanded = false
+        }
+    }
 
     Card(
         modifier = Modifier
@@ -3276,29 +3333,75 @@ private fun MeetingCalendar(
                 )
             }
 
-            Text(
-                text = when (viewMode) {
-                    CalendarViewMode.Week -> weekRangeLabel(calendarMeetings)
-                    CalendarViewMode.Month -> "${focusedYear}.${focusedMonth.toString().padStart(2, '0')}"
-                    CalendarViewMode.Year -> focusedYear.toString()
-                },
-                modifier = Modifier.pointerInput(detail, viewMode) {
-                    detectTapGestures {
-                        if (viewMode == CalendarViewMode.Week && detail != null) {
-                            onClearDetail()
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.Top
+            ) {
+                Text(
+                    text = when (viewMode) {
+                        CalendarViewMode.Week -> weekRangeLabel(calendarMeetings)
+                        CalendarViewMode.Month -> "${focusedYear}.${focusedMonth.toString().padStart(2, '0')}"
+                        CalendarViewMode.Year -> focusedYear.toString()
+                    },
+                    modifier = Modifier
+                        .weight(1f)
+                        .pointerInput(detail, viewMode, friendFilterExpanded) {
+                            detectTapGestures {
+                                collapseFriendFilter()
+                                if (viewMode == CalendarViewMode.Week && detail != null) {
+                                    onClearDetail()
+                                }
+                            }
+                        },
+                    style = MaterialTheme.typography.labelLarge,
+                    color = TouchColors.TextMuted,
+                    fontWeight = FontWeight.Medium
+                )
+
+                Text(
+                    text = selectedFriend?.displayName ?: "\u5168\u90e8",
+                    modifier = Modifier.cuteClickable { friendFilterExpanded = !friendFilterExpanded },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TouchColors.TextMuted,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+
+            AnimatedVisibility(
+                visible = friendFilterExpanded,
+                enter = fadeIn(tween(150, easing = FastOutSlowInEasing)) +
+                    slideInVertically(tween(150, easing = FastOutSlowInEasing)) { -it / 18 },
+                exit = fadeOut(tween(260, easing = FastOutSlowInEasing)) +
+                    slideOutVertically(tween(260, easing = FastOutSlowInEasing)) { -it / 20 }
+            ) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = TouchColors.DetailSurface,
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FriendFilterChip(
+                            label = "\u5168\u90e8",
+                            selected = selectedFriend == null,
+                            onClick = { onFriendFilterChanged(null) }
+                        )
+                        friends.forEach { friend ->
+                            FriendFilterChip(
+                                label = friend.displayName,
+                                selected = selectedFriend?.userId == friend.userId,
+                                onClick = { onFriendFilterChanged(friend) }
+                            )
                         }
                     }
-                },
-                style = MaterialTheme.typography.labelLarge,
-                color = TouchColors.TextMuted,
-                fontWeight = FontWeight.Medium
-            )
-
-            FriendFilterRow(
-                friends = friends,
-                selectedFriend = selectedFriend,
-                onFriendFilterChanged = onFriendFilterChanged
-            )
+                }
+            }
 
             var dragOffset by remember(viewMode, focusedYear, focusedMonth, calendarMeetings.firstOrNull()?.date) {
                 mutableStateOf(0f)
@@ -3415,17 +3518,40 @@ private fun MeetingCalendar(
                             calendarMeetings = calendarMeetings,
                             friends = friends,
                             authApiClient = authApiClient,
-                            onDaySelected = onDaySelected,
-                            onDayLongPressed = onDayLongPressed,
-                            onRangeSwipe = onRangeSwipe
+                            isFriendFiltered = isFriendFiltered,
+                            onDaySelected = { date, records ->
+                                collapseFriendFilter()
+                                onDaySelected(date, records)
+                            },
+                            onDayLongPressed = { date, records ->
+                                collapseFriendFilter()
+                                onDayLongPressed(date, records)
+                            },
+                            onRangeSwipe = {
+                                collapseFriendFilter()
+                                onRangeSwipe(it)
+                            }
                         )
                         CalendarViewMode.Month -> MonthCalendarView(
                             monthMeetings = monthMeetings,
                             isFriendFiltered = isFriendFiltered,
-                            onMonthDaySelected = onMonthDaySelected,
-                            onMonthDayLongPressed = onMonthDayLongPressed
+                            onMonthDaySelected = {
+                                collapseFriendFilter()
+                                onMonthDaySelected(it)
+                            },
+                            onMonthDayLongPressed = {
+                                collapseFriendFilter()
+                                onMonthDayLongPressed(it)
+                            }
                         )
-                        CalendarViewMode.Year -> YearCalendarView(yearMeetings, isFriendFiltered, onYearMonthSelected)
+                        CalendarViewMode.Year -> YearCalendarView(
+                            yearMeetings,
+                            isFriendFiltered,
+                            onYearMonthSelected = {
+                                collapseFriendFilter()
+                                onYearMonthSelected(it)
+                            }
+                        )
                     }
                 }
             }
@@ -3494,6 +3620,7 @@ private fun WeekCalendarView(
     calendarMeetings: List<CalendarMeeting>,
     friends: List<FriendUser>,
     authApiClient: AuthApiClient,
+    isFriendFiltered: Boolean,
     onDaySelected: (String, List<MeetingRecord>) -> Unit,
     onDayLongPressed: (String, List<MeetingRecord>) -> Unit,
     onRangeSwipe: (Int) -> Unit
@@ -3628,6 +3755,7 @@ private fun WeekCalendarView(
                 meeting = day,
                 friends = friends,
                 authApiClient = authApiClient,
+                isFriendFiltered = isFriendFiltered,
                 onClick = { onDaySelected(day.date, day.records) },
                 onLongClick = { onDayLongPressed(day.date, day.records) },
                 modifier = Modifier.width(76.dp)
@@ -3858,6 +3986,12 @@ private fun CalendarDetailPanel(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
+                                MeetingFriendAvatar(
+                                    record = record,
+                                    friend = record.personUserId?.let { friendsById[it] },
+                                    authApiClient = authApiClient,
+                                    size = 24
+                                )
                                 Text(
                                     text = record.personName,
                                     style = MaterialTheme.typography.bodyMedium,
@@ -3865,12 +3999,6 @@ private fun CalendarDetailPanel(
                                     fontWeight = FontWeight.SemiBold,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
-                                )
-                                MeetingFriendAvatar(
-                                    record = record,
-                                    friend = record.personUserId?.let { friendsById[it] },
-                                    authApiClient = authApiClient,
-                                    size = 24
                                 )
                             }
                             Text(
@@ -5096,17 +5224,21 @@ private fun CalendarDayCard(
     meeting: CalendarMeeting,
     friends: List<FriendUser>,
     authApiClient: AuthApiClient,
+    isFriendFiltered: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val friendsById = remember(friends) { friends.associateBy { it.userId } }
-    val avatarRecords = remember(meeting.records, friends) {
-        meeting.records.distinctBy { it.personUserId ?: it.personName }.take(3)
+    val distinctAvatarRecords = remember(meeting.records, friends) {
+        meeting.records.distinctBy { it.personUserId ?: it.personName }
+    }
+    val avatarRecords = remember(distinctAvatarRecords) {
+        distinctAvatarRecords.take(5)
     }
     Surface(
         modifier = modifier
-            .height(122.dp)
+            .height(138.dp)
             .pointerInput(meeting.date) {
                 detectTapGestures(
                     onTap = { onClick() },
@@ -5114,8 +5246,8 @@ private fun CalendarDayCard(
                 )
             },
         color = when {
+            meeting.records.isNotEmpty() -> meetingHeatColor(meeting.records.size)
             meeting.isToday -> TouchColors.CalendarToday
-            meeting.records.isNotEmpty() -> TouchColors.SuccessSoft
             else -> TouchColors.CalendarTile
         },
         shape = RoundedCornerShape(8.dp),
@@ -5123,7 +5255,7 @@ private fun CalendarDayCard(
     ) {
         Column(
             modifier = Modifier.padding(10.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+            verticalArrangement = Arrangement.spacedBy(5.dp)
         ) {
             Text(
                 text = meeting.weekday,
@@ -5154,38 +5286,92 @@ private fun CalendarDayCard(
                         overflow = TextOverflow.Clip
                     )
                 } else {
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy((-5).dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        avatarRecords.forEach { record ->
-                            MeetingFriendAvatar(
-                                record = record,
-                                friend = record.personUserId?.let { friendsById[it] },
-                                authApiClient = authApiClient,
-                                size = 24
-                            )
-                        }
-                    }
-                    if (meeting.records.isNotEmpty()) {
-                        Text(
-                            text = "${meeting.records.size}\u6b21",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = TouchColors.TextMuted,
-                            maxLines = 1,
-                            overflow = TextOverflow.Clip
-                        )
-                    }
-                }
-                if (avatarRecords.size < meeting.records.distinctBy { it.personUserId ?: it.personName }.size) {
-                    Text(
-                        text = "+${meeting.records.distinctBy { it.personUserId ?: it.personName }.size - avatarRecords.size}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TouchColors.TextMuted,
-                        maxLines = 1,
-                        overflow = TextOverflow.Clip
+                    CalendarAvatarStack(
+                        records = avatarRecords,
+                        totalMeetings = meeting.records.size,
+                        totalPeople = distinctAvatarRecords.size,
+                        hiddenFriendCount = distinctAvatarRecords.size - avatarRecords.size,
+                        isFriendFiltered = isFriendFiltered,
+                        friendsById = friendsById,
+                        authApiClient = authApiClient
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CalendarAvatarStack(
+    records: List<MeetingRecord>,
+    totalMeetings: Int,
+    totalPeople: Int,
+    hiddenFriendCount: Int,
+    isFriendFiltered: Boolean,
+    friendsById: Map<String, FriendUser>,
+    authApiClient: AuthApiClient
+) {
+    val avatarSize = when {
+        records.size <= 2 -> 25
+        records.size == 3 -> 23
+        else -> 21
+    }
+    val stackWidth = 58.dp
+    val avatarSizeDp = avatarSize.dp
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(1.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .width(stackWidth)
+                .height(27.dp),
+            contentAlignment = Alignment.CenterStart
+        ) {
+            val available = stackWidth - avatarSizeDp
+            val step = if (records.size <= 1) {
+                0.dp
+            } else {
+                available / (records.size - 1)
+            }
+            records.forEachIndexed { index, record ->
+                Box(
+                    modifier = Modifier.graphicsLayer {
+                        translationX = step.toPx() * index
+                    }
+                ) {
+                    MeetingFriendAvatar(
+                        record = record,
+                        friend = record.personUserId?.let { friendsById[it] },
+                        authApiClient = authApiClient,
+                        size = avatarSize
+                    )
+                }
+            }
+        }
+        Surface(
+            color = TouchColors.Surface.copy(alpha = 0.94f),
+            shape = RoundedCornerShape(50),
+            shadowElevation = 1.dp
+        ) {
+            Box(
+                modifier = Modifier
+                    .height(18.dp)
+                    .padding(horizontal = 6.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = when {
+                        hiddenFriendCount > 0 -> "+$hiddenFriendCount"
+                        isFriendFiltered -> "${totalMeetings}\u6b21"
+                        else -> "${totalPeople}\u4eba"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TouchColors.PrimaryDark,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Clip
+                )
             }
         }
     }
