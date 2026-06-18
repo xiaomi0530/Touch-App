@@ -23,13 +23,16 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 DB_PATH = DATA_DIR / "touch_dev.sqlite3"
 SECRET_PATH = DATA_DIR / "dev_token_secret.key"
 UPLOAD_DIR = DATA_DIR / "uploads" / "avatars"
+CARD_BACKGROUND_UPLOAD_DIR = DATA_DIR / "uploads" / "card-backgrounds"
 
 ACCESS_TOKEN_TTL_SECONDS = 15 * 60
 REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 PASSWORD_ITERATIONS = 600_000
 MAX_BODY_BYTES = 16 * 1024
 MAX_AVATAR_BYTES = 2 * 1024 * 1024
+MAX_CARD_BACKGROUND_BYTES = 3 * 1024 * 1024
 MEET_TOKEN_TTL_SECONDS = 120
+DEFAULT_CARD_BACKGROUND_KEYS = {"mizuki", "muelsyse", "shu"}
 
 
 def utc_now() -> int:
@@ -141,6 +144,12 @@ class User:
     email: str
     created_at: int
     avatar_path: str | None
+    bio: str | None
+    birthday: str | None
+    gender: str | None
+    card_background_path: str | None
+    card_background_key: str | None
+    last_seen_at: int | None
 
 
 def connect_db() -> sqlite3.Connection:
@@ -162,7 +171,13 @@ def init_db() -> None:
                 password_salt TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                avatar_path TEXT
+                avatar_path TEXT,
+                bio TEXT,
+                birthday TEXT,
+                gender TEXT,
+                card_background_path TEXT,
+                card_background_key TEXT,
+                last_seen_at INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS refresh_tokens (
@@ -259,6 +274,16 @@ def init_db() -> None:
         columns = {row["name"] for row in db.execute("PRAGMA table_info(users)").fetchall()}
         if "avatar_path" not in columns:
             db.execute("ALTER TABLE users ADD COLUMN avatar_path TEXT")
+        for column_name, column_type in (
+            ("bio", "TEXT"),
+            ("birthday", "TEXT"),
+            ("gender", "TEXT"),
+            ("card_background_path", "TEXT"),
+            ("card_background_key", "TEXT"),
+            ("last_seen_at", "INTEGER"),
+        ):
+            if column_name not in columns:
+                db.execute(f"ALTER TABLE users ADD COLUMN {column_name} {column_type}")
         meeting_columns = {row["name"] for row in db.execute("PRAGMA table_info(meetings)").fetchall()}
         if "person_user_id" not in meeting_columns:
             db.execute("ALTER TABLE meetings ADD COLUMN person_user_id TEXT REFERENCES users(id) ON DELETE SET NULL")
@@ -289,17 +314,34 @@ def user_from_row(row: sqlite3.Row) -> User:
         email=row["email"],
         created_at=row["created_at"],
         avatar_path=row["avatar_path"],
+        bio=row["bio"],
+        birthday=row["birthday"],
+        gender=row["gender"],
+        card_background_path=row["card_background_path"],
+        card_background_key=row["card_background_key"],
+        last_seen_at=row["last_seen_at"],
     )
 
 
 def public_user(user: User) -> dict[str, Any]:
     avatar_url = f"/uploads/avatars/{user.avatar_path}" if user.avatar_path else None
+    card_background_url = (
+        f"/uploads/card-backgrounds/{user.card_background_path}"
+        if user.card_background_path
+        else None
+    )
     return {
         "id": user.id,
         "displayName": user.display_name,
         "email": user.email,
         "createdAt": user.created_at,
         "avatarUrl": avatar_url,
+        "bio": user.bio,
+        "birthday": user.birthday,
+        "gender": user.gender,
+        "cardBackgroundUrl": card_background_url,
+        "cardBackgroundKey": user.card_background_key,
+        "lastSeenAt": user.last_seen_at,
     }
 
 
@@ -320,6 +362,41 @@ def display_name_is_taken(db: sqlite3.Connection, display_name: str, excluding_u
             (normalized,),
         ).fetchone()
     return row is not None
+
+
+def normalize_optional_text(value: Any, max_length: int) -> str | None:
+    text = str(value or "").strip()
+    return text[:max_length] if text else None
+
+
+def normalize_birthday(value: Any) -> str | None:
+    birthday = str(value or "").strip()
+    if not birthday:
+        return None
+    if len(birthday) != 10 or birthday[4] != "-" or birthday[7] != "-":
+        raise ApiError(400, "invalid_birthday", "生日格式应为 YYYY-MM-DD。")
+    try:
+        year = int(birthday[0:4])
+        month = int(birthday[5:7])
+        day = int(birthday[8:10])
+    except ValueError as exc:
+        raise ApiError(400, "invalid_birthday", "生日格式应为 YYYY-MM-DD。") from exc
+    if year < 1900 or year > 2100 or month < 1 or month > 12 or day < 1 or day > 31:
+        raise ApiError(400, "invalid_birthday", "生日日期不合法。")
+    return birthday
+
+
+def normalize_gender(value: Any) -> str | None:
+    gender = str(value or "").strip()
+    if not gender:
+        return None
+    if gender not in {"男", "女", "其他", "保密"}:
+        raise ApiError(400, "invalid_gender", "性别选项不合法。")
+    return gender
+
+
+def mark_user_seen(db: sqlite3.Connection, user_id: str, seen_at: int | None = None) -> None:
+    db.execute("UPDATE users SET last_seen_at = ? WHERE id = ?", (seen_at or utc_now(), user_id))
 
 
 def public_meeting(row: sqlite3.Row) -> dict[str, Any]:
@@ -515,25 +592,38 @@ def seed_local_demo_user(db: sqlite3.Connection) -> None:
     password = "12345678"
     now = utc_now()
 
-    def upsert_demo_user(demo_user_id: str, demo_display_name: str, demo_email: str) -> None:
+    def upsert_demo_user(
+        demo_user_id: str,
+        demo_display_name: str,
+        demo_email: str,
+        bio: str,
+        birthday: str,
+        gender: str,
+        background_key: str,
+    ) -> None:
         existing = db.execute("SELECT id FROM users WHERE id = ? OR email = ?", (demo_user_id, demo_email)).fetchone()
         salt, password_hash = hash_password("12345678")
         if existing is None:
             db.execute(
                 """
-                INSERT INTO users (id, display_name, email, password_salt, password_hash, created_at, avatar_path)
-                VALUES (?, ?, ?, ?, ?, ?, NULL)
+                INSERT INTO users (
+                    id, display_name, email, password_salt, password_hash, created_at,
+                    avatar_path, bio, birthday, gender, card_background_path, card_background_key, last_seen_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?, ?)
                 """,
-                (demo_user_id, demo_display_name, demo_email, salt, password_hash, now),
+                (demo_user_id, demo_display_name, demo_email, salt, password_hash, now, bio, birthday, gender, background_key, now),
             )
             return
         db.execute(
             """
             UPDATE users
-            SET display_name = ?, email = ?, password_salt = ?, password_hash = ?
+            SET display_name = ?, email = ?, password_salt = ?, password_hash = ?,
+                bio = ?, birthday = ?, gender = ?, card_background_key = ?,
+                card_background_path = NULL, last_seen_at = ?
             WHERE id = ?
             """,
-            (demo_display_name, demo_email, salt, password_hash, existing["id"]),
+            (demo_display_name, demo_email, salt, password_hash, bio, birthday, gender, background_key, now, existing["id"]),
         )
 
     def upsert_demo_friendship(owner_user_id: str, friend_user_id: str) -> None:
@@ -563,10 +653,13 @@ def seed_local_demo_user(db: sqlite3.Connection) -> None:
         salt, password_hash = hash_password(password)
         db.execute(
             """
-            INSERT INTO users (id, display_name, email, password_salt, password_hash, created_at, avatar_path)
-            VALUES (?, ?, ?, ?, ?, ?, NULL)
+            INSERT INTO users (
+                id, display_name, email, password_salt, password_hash, created_at,
+                avatar_path, bio, birthday, gender, card_background_path, card_background_key, last_seen_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, 'mizuki', ?)
             """,
-            (user_id, display_name, email, salt, password_hash, now),
+            (user_id, display_name, email, salt, password_hash, now, "正在把每一次碰面认真收藏起来。", "2003-05-30", "保密", now),
         )
     else:
         user_id = row["id"]
@@ -574,24 +667,44 @@ def seed_local_demo_user(db: sqlite3.Connection) -> None:
         db.execute(
             """
             UPDATE users
-            SET display_name = ?, password_salt = ?, password_hash = ?
+            SET display_name = ?, password_salt = ?, password_hash = ?,
+                bio = ?, birthday = ?, gender = ?, card_background_key = COALESCE(card_background_key, 'mizuki'),
+                last_seen_at = ?
             WHERE id = ?
             """,
-            (display_name, salt, password_hash, user_id),
+            (display_name, salt, password_hash, "正在把每一次碰面认真收藏起来。", "2003-05-30", "保密", now, user_id),
         )
 
+    db.execute(
+        """
+        UPDATE friendships
+        SET status = 'removed', updated_at = ?
+        WHERE (requester_user_id = ? OR addressee_user_id = ?)
+          AND (
+              requester_user_id LIKE 'user_demo_%'
+              OR addressee_user_id LIKE 'user_demo_%'
+          )
+        """,
+        (now, user_id, user_id),
+    )
+    db.execute("DELETE FROM meetings WHERE id LIKE 'meet_demo_%'")
+
     demo_meetings = [
-        ("meet_demo_2026_01_08_chen", "闄堟灄", "2026-01-08", "11:20"),
-        ("meet_demo_2026_03_02_maya", "寰愰泤", "2026-03-02", "09:30"),
-        ("meet_demo_2026_03_22_wang", "鐜嬪畨", "2026-03-22", "16:10"),
-        ("meet_demo_2026_06_16_wang", "鐜嬪畨", "2026-06-16", "18:05"),
-        ("meet_demo_2026_06_17_chen", "闄堟灄", "2026-06-17", "09:42"),
-        ("meet_demo_2026_06_17_xu", "寰愰泤", "2026-06-17", "09:18"),
-        ("meet_demo_2026_06_20_li", "鏉庤秺", "2026-06-20", "14:35"),
-        ("meet_demo_2026_09_07_yun", "鍛ㄤ簯", "2026-09-07", "13:00"),
-        ("meet_demo_2026_11_03_he", "浣曞畞", "2026-11-03", "10:25"),
-        ("meet_demo_2026_11_11_luo", "缃楀矚", "2026-11-11", "19:40"),
-        ("meet_demo_2026_11_28_tan", "璋垷", "2026-11-28", "15:50"),
+        ("meet_demo_2026_06_03_chen", "陈林", "2026-06-03", "10:20"),
+        ("meet_demo_2026_06_05_xu", "徐雅", "2026-06-05", "18:05"),
+        ("meet_demo_2026_06_07_wang", "王安", "2026-06-07", "14:35"),
+        ("meet_demo_2026_06_10_chen", "陈林", "2026-06-10", "09:42"),
+        ("meet_demo_2026_06_12_chen", "陈林", "2026-06-12", "16:10"),
+        ("meet_demo_2026_06_14_xu", "徐雅", "2026-06-14", "20:15"),
+        ("meet_demo_2026_06_16_wang", "王安", "2026-06-16", "18:05"),
+        ("meet_demo_2026_06_17_chen", "陈林", "2026-06-17", "09:42"),
+        ("meet_demo_2026_06_17_xu", "徐雅", "2026-06-17", "13:18"),
+        ("meet_demo_2026_06_18_chen", "陈林", "2026-06-18", "11:06"),
+        ("meet_demo_2026_06_18_wang", "王安", "2026-06-18", "19:30"),
+        ("meet_demo_2026_07_02_xu", "徐雅", "2026-07-02", "15:10"),
+        ("meet_demo_2026_07_11_chen", "陈林", "2026-07-11", "12:25"),
+        ("meet_demo_2026_08_22_wang", "王安", "2026-08-22", "17:55"),
+        ("meet_demo_2026_11_11_chen", "陈林", "2026-11-11", "19:40"),
     ]
     for meeting_id, person_name, met_date, met_time in demo_meetings:
         db.execute(
@@ -604,31 +717,30 @@ def seed_local_demo_user(db: sqlite3.Connection) -> None:
         )
 
     demo_friends = [
-        ("user_demo_chen_lin", "\u9648\u6797", "chenlin.demo@touch.local"),
-        ("user_demo_xu_ya", "\u5f90\u96c5", "xuya.demo@touch.local"),
-        ("user_demo_wang_an", "\u738b\u5b89", "wangan.demo@touch.local"),
-        ("user_demo_li_yue", "\u674e\u8d8a", "liyue.demo@touch.local"),
-        ("user_demo_zhou_yun", "\u5468\u4e91", "zhouyun.demo@touch.local"),
-        ("user_demo_he_ning", "\u4f55\u5b81", "hening.demo@touch.local"),
-        ("user_demo_luo_yu", "\u7f57\u5c7f", "luoyu.demo@touch.local"),
-        ("user_demo_tan_shu", "\u8c2d\u8212", "tanshu.demo@touch.local"),
+        ("user_demo_chen_lin", "陈林", "chenlin.demo@touch.local", "喜欢把城市里的偶遇写进手账。", "2002-02-14", "女", "muelsyse"),
+        ("user_demo_xu_ya", "徐雅", "xuya.demo@touch.local", "周末常在展览、咖啡店和图书馆之间移动。", "2001-09-03", "女", "shu"),
+        ("user_demo_wang_an", "王安", "wangan.demo@touch.local", "电子设备和现场音乐爱好者，碰面频率很高。", "2000-12-22", "男", "mizuki"),
     ]
-    for friend_id, friend_name, friend_email in demo_friends:
-        upsert_demo_user(friend_id, friend_name, friend_email)
+    for friend_id, friend_name, friend_email, bio, birthday, gender, background_key in demo_friends:
+        upsert_demo_user(friend_id, friend_name, friend_email, bio, birthday, gender, background_key)
         upsert_demo_friendship(user_id, friend_id)
 
     demo_meeting_friends = {
-        "meet_demo_2026_01_08_chen": ("user_demo_chen_lin", "\u9648\u6797"),
-        "meet_demo_2026_03_02_maya": ("user_demo_xu_ya", "\u5f90\u96c5"),
-        "meet_demo_2026_03_22_wang": ("user_demo_wang_an", "\u738b\u5b89"),
-        "meet_demo_2026_06_16_wang": ("user_demo_wang_an", "\u738b\u5b89"),
-        "meet_demo_2026_06_17_chen": ("user_demo_chen_lin", "\u9648\u6797"),
-        "meet_demo_2026_06_17_xu": ("user_demo_xu_ya", "\u5f90\u96c5"),
-        "meet_demo_2026_06_20_li": ("user_demo_li_yue", "\u674e\u8d8a"),
-        "meet_demo_2026_09_07_yun": ("user_demo_zhou_yun", "\u5468\u4e91"),
-        "meet_demo_2026_11_03_he": ("user_demo_he_ning", "\u4f55\u5b81"),
-        "meet_demo_2026_11_11_luo": ("user_demo_luo_yu", "\u7f57\u5c7f"),
-        "meet_demo_2026_11_28_tan": ("user_demo_tan_shu", "\u8c2d\u8212"),
+        "meet_demo_2026_06_03_chen": ("user_demo_chen_lin", "陈林"),
+        "meet_demo_2026_06_05_xu": ("user_demo_xu_ya", "徐雅"),
+        "meet_demo_2026_06_07_wang": ("user_demo_wang_an", "王安"),
+        "meet_demo_2026_06_10_chen": ("user_demo_chen_lin", "陈林"),
+        "meet_demo_2026_06_12_chen": ("user_demo_chen_lin", "陈林"),
+        "meet_demo_2026_06_14_xu": ("user_demo_xu_ya", "徐雅"),
+        "meet_demo_2026_06_16_wang": ("user_demo_wang_an", "王安"),
+        "meet_demo_2026_06_17_chen": ("user_demo_chen_lin", "陈林"),
+        "meet_demo_2026_06_17_xu": ("user_demo_xu_ya", "徐雅"),
+        "meet_demo_2026_06_18_chen": ("user_demo_chen_lin", "陈林"),
+        "meet_demo_2026_06_18_wang": ("user_demo_wang_an", "王安"),
+        "meet_demo_2026_07_02_xu": ("user_demo_xu_ya", "徐雅"),
+        "meet_demo_2026_07_11_chen": ("user_demo_chen_lin", "陈林"),
+        "meet_demo_2026_08_22_wang": ("user_demo_wang_an", "王安"),
+        "meet_demo_2026_11_11_chen": ("user_demo_chen_lin", "陈林"),
     }
     for meeting_id, (friend_id, friend_name) in demo_meeting_friends.items():
         db.execute(
@@ -785,6 +897,9 @@ class TouchHandler(BaseHTTPRequestHandler):
             if method == "GET" and path.startswith("/uploads/avatars/"):
                 self.handle_avatar_file(path)
                 return
+            if method == "GET" and path.startswith("/uploads/card-backgrounds/"):
+                self.handle_card_background_file(path)
+                return
             if method == "POST" and path == "/auth/register":
                 self.handle_register()
                 return
@@ -805,6 +920,9 @@ class TouchHandler(BaseHTTPRequestHandler):
                 return
             if method == "POST" and path == "/account/avatar":
                 self.handle_avatar_upload()
+                return
+            if method == "POST" and path == "/account/card-background":
+                self.handle_card_background_upload()
                 return
             if method == "POST" and path == "/devices/register":
                 self.handle_device_register()
@@ -883,17 +1001,20 @@ class TouchHandler(BaseHTTPRequestHandler):
                     raise ApiError(409, "display_name_taken", "这个昵称已被占用，请换一个昵称。")
                 db.execute(
                     """
-                    INSERT INTO users (id, display_name, email, password_salt, password_hash, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO users (
+                        id, display_name, email, password_salt, password_hash, created_at,
+                        bio, birthday, gender, card_background_path, card_background_key, last_seen_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 'mizuki', ?)
                     """,
-                    (user_id, display_name, email, salt, password_hash, now),
+                    (user_id, display_name, email, salt, password_hash, now, now),
                 )
                 session = create_session(db, user_id)
-                user = User(user_id, display_name, email, now, None)
+                user_row = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         except sqlite3.IntegrityError as exc:
             raise ApiError(409, "email_already_registered", "Email is already registered.") from exc
 
-        self.respond_json(201, {"user": public_user(user), **session})
+        self.respond_json(201, {"user": public_user(user_from_row(user_row)), **session})
 
     def handle_login(self) -> None:
         body = self.read_json_body()
@@ -904,10 +1025,11 @@ class TouchHandler(BaseHTTPRequestHandler):
             row = db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
             if row is None or not verify_password(password, row["password_salt"], row["password_hash"]):
                 raise ApiError(401, "invalid_credentials", "Email or password is incorrect.")
+            mark_user_seen(db, row["id"])
             session = create_session(db, row["id"])
-            user = user_from_row(row)
+            updated_row = db.execute("SELECT * FROM users WHERE id = ?", (row["id"],)).fetchone()
 
-        self.respond_json(200, {"user": public_user(user), **session})
+        self.respond_json(200, {"user": public_user(user_from_row(updated_row)), **session})
 
     def handle_refresh(self) -> None:
         body = self.read_json_body()
@@ -927,6 +1049,7 @@ class TouchHandler(BaseHTTPRequestHandler):
                 raise ApiError(401, "invalid_refresh_token", "Refresh token is invalid or expired.")
 
             db.execute("UPDATE refresh_tokens SET revoked_at = ? WHERE id = ?", (utc_now(), row["id"]))
+            mark_user_seen(db, row["user_id"])
             session = create_session(db, row["user_id"])
             user_row = db.execute("SELECT * FROM users WHERE id = ?", (row["user_id"],)).fetchone()
             if user_row is None:
@@ -948,6 +1071,7 @@ class TouchHandler(BaseHTTPRequestHandler):
     def handle_account_me(self) -> None:
         user_id = get_authenticated_user_id(self.request_headers())
         with connect_db() as db:
+            mark_user_seen(db, user_id)
             row = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
             if row is None:
                 raise ApiError(401, "user_not_found", "Authenticated user no longer exists.")
@@ -994,11 +1118,35 @@ class TouchHandler(BaseHTTPRequestHandler):
             raise ApiError(400, "missing_display_name", "Display name is required.")
         if len(display_name) > 40:
             raise ApiError(400, "display_name_too_long", "Display name is too long.")
+        bio = normalize_optional_text(body.get("bio"), 160)
+        birthday = normalize_birthday(body.get("birthday"))
+        gender = normalize_gender(body.get("gender"))
+        card_background_key = str(body.get("cardBackgroundKey", "")).strip()
+        if card_background_key and card_background_key not in DEFAULT_CARD_BACKGROUND_KEYS:
+            raise ApiError(400, "invalid_card_background", "名片背景选项不合法。")
 
         with connect_db() as db:
             if display_name_is_taken(db, display_name, excluding_user_id=user_id):
                 raise ApiError(409, "display_name_taken", "这个昵称已被占用，请换一个昵称。")
-            db.execute("UPDATE users SET display_name = ? WHERE id = ?", (display_name, user_id))
+            if card_background_key:
+                db.execute(
+                    """
+                    UPDATE users
+                    SET display_name = ?, bio = ?, birthday = ?, gender = ?,
+                        card_background_key = ?, card_background_path = NULL, last_seen_at = ?
+                    WHERE id = ?
+                    """,
+                    (display_name, bio, birthday, gender, card_background_key, utc_now(), user_id),
+                )
+            else:
+                db.execute(
+                    """
+                    UPDATE users
+                    SET display_name = ?, bio = ?, birthday = ?, gender = ?, last_seen_at = ?
+                    WHERE id = ?
+                    """,
+                    (display_name, bio, birthday, gender, utc_now(), user_id),
+                )
             row = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
             if row is None:
                 raise ApiError(401, "user_not_found", "Authenticated user no longer exists.")
@@ -1040,6 +1188,49 @@ class TouchHandler(BaseHTTPRequestHandler):
 
         self.respond_json(200, {"user": public_user(user_from_row(row))})
 
+    def handle_card_background_upload(self) -> None:
+        user_id = get_authenticated_user_id(self.request_headers())
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type or "boundary=" not in content_type:
+            raise ApiError(400, "invalid_multipart", "Background upload must use multipart/form-data.")
+
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length <= 0 or content_length > MAX_CARD_BACKGROUND_BYTES + 4096:
+            raise ApiError(413, "background_too_large", "Card background image is too large.")
+
+        raw_body = self.rfile.read(content_length)
+        boundary = content_type.split("boundary=", 1)[1].strip().strip('"')
+        image_bytes, filename = parse_multipart_file(raw_body, boundary, "background")
+        if len(image_bytes) > MAX_CARD_BACKGROUND_BYTES:
+            raise ApiError(413, "background_too_large", "Card background image is too large.")
+
+        extension = safe_avatar_extension(filename, image_bytes)
+        stored_name = f"{user_id}_{uuid.uuid4().hex}{extension}"
+        CARD_BACKGROUND_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        (CARD_BACKGROUND_UPLOAD_DIR / stored_name).write_bytes(image_bytes)
+
+        with connect_db() as db:
+            old_row = db.execute("SELECT card_background_path FROM users WHERE id = ?", (user_id,)).fetchone()
+            if old_row is None:
+                raise ApiError(401, "user_not_found", "Authenticated user no longer exists.")
+            old_background = old_row["card_background_path"]
+            db.execute(
+                """
+                UPDATE users
+                SET card_background_path = ?, card_background_key = NULL, last_seen_at = ?
+                WHERE id = ?
+                """,
+                (stored_name, utc_now(), user_id),
+            )
+            row = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+
+        if old_background:
+            old_path = CARD_BACKGROUND_UPLOAD_DIR / old_background
+            if old_path.exists() and old_path.is_file():
+                old_path.unlink()
+
+        self.respond_json(200, {"user": public_user(user_from_row(row))})
+
     def handle_avatar_file(self, path: str) -> None:
         filename = path.rsplit("/", 1)[-1]
         if "/" in filename or "\\" in filename or ".." in filename:
@@ -1047,6 +1238,22 @@ class TouchHandler(BaseHTTPRequestHandler):
         file_path = UPLOAD_DIR / filename
         if not file_path.exists() or not file_path.is_file():
             raise ApiError(404, "not_found", "Avatar not found.")
+
+        raw = file_path.read_bytes()
+        self.send_response(200)
+        self.write_common_headers()
+        self.send_header("Content-Type", mimetypes.guess_type(filename)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def handle_card_background_file(self, path: str) -> None:
+        filename = path.rsplit("/", 1)[-1]
+        if "/" in filename or "\\" in filename or ".." in filename:
+            raise ApiError(400, "invalid_file", "Background path is invalid.")
+        file_path = CARD_BACKGROUND_UPLOAD_DIR / filename
+        if not file_path.exists() or not file_path.is_file():
+            raise ApiError(404, "not_found", "Background not found.")
 
         raw = file_path.read_bytes()
         self.send_response(200)

@@ -154,6 +154,10 @@ Current account rules:
 - Display names are limited to 40 characters.
 - Display names must be unique case-insensitively across users during registration and account profile updates.
 - If a requested display name is already occupied, the backend must reject the request and the Android UI must show a textual error instead of silently changing the name.
+- User profile cards include display name, avatar, short bio, birthday, gender, card background image or default card background, and server-recorded last-seen time.
+- Profile card metadata and uploaded card backgrounds must be stored on the backend and returned through account/friend user payloads. The client may cache display data but must not be the source of truth.
+- Last-seen time is written by the backend during authenticated activity such as login, refresh, and account lookup. The client must only display it and must not submit arbitrary last-seen values.
+- While editing the user's profile card, changing the default card background or choosing a local background image must update the visible card preview immediately. Background image selection should remain a draft preview until the user taps save, at which point the image is uploaded and the profile update is committed.
 
 Production authentication requirements:
 
@@ -177,6 +181,7 @@ POST /auth/logout
 GET  /account/me
 PATCH /account/me
 POST /account/avatar
+POST /account/card-background
 ```
 
 The UI must clearly distinguish authenticated, unauthenticated, pending, and failed authentication states.
@@ -289,6 +294,8 @@ Friend management requirements:
 - Users can block or unblock a friend for touch interactions.
 - Users can set a private remark for an accepted friend. Remarks are viewer-specific and must be stored server-side, not only in local UI state.
 - The friends page can open a friend card from an accepted friend's avatar. The card should show friend identity, the viewer's remark, and recent meeting counts with that friend.
+- Friend cards should also show the friend's cloud-backed public profile card fields: avatar, card background, bio, birthday, gender, and last-seen time.
+- Friend management sections, including search, incoming requests, accepted friends, and outgoing requests, should use full-width white section cards consistently even when a section is empty. Search input and search button should be height-aligned and visually balanced.
 - A blocked friendship remains visible as a relationship state, but blocked touch attempts must not create confirmed meeting records.
 - If two non-friends complete the NFC tap proof exchange, the backend must return a `friend_required` state instead of creating a meeting. The client may ask whether to send a friend request.
 - Calendar week/month/year views must support filtering by all meeting records or by one accepted friend.
@@ -375,6 +382,7 @@ Current interaction style:
 - Calendar month/year cells should show people counts only in the all-friends view. When filtered to one friend, cells should use the one-person heat color and omit `x人` count labels.
 - The default calendar mode when entering the main screen is month view.
 - Week day tap opens inline details. If the inline detail for that same day is already open, tapping that day again collapses it. While week inline details are open, tapping non-day areas such as the calendar title/range or the detail panel collapses the inline detail. Tapping another week day switches the inline detail to that day. Week day long-press opens the focused day detail dialog.
+- Week date cards should show met friends as compact avatar stacks instead of text names. Inline week detail rows should keep the existing time/name layout but include the friend's current avatar beside the name. These avatars must be resolved from the latest friend profile data and fall back gracefully to initials when no avatar is available.
 - Month day tap opens that week view. Month day long-press opens that day's detail dialog directly without switching to week view.
 - Day detail dialogs may show met friends as compact bubbles and allow creating a personal "today's event" with selected friend participants, text, and up to six images.
 - The create-event participant picker must only show people who actually have a confirmed meeting record on that selected day. If no such people exist, the participant picker should not be shown.
@@ -387,6 +395,8 @@ Current interaction style:
 - New and edited event image strips should support a delete mode: long-press an image to lift the image strip into an elevated arrangement, then swipe an image upward to remove it.
 - Saved day event cards should support long-press delete with an explicit confirmation dialog. Deletion must be confirmed by the backend before removing the card from the visible list.
 - Inline panels should avoid complex enter/exit animations; prefer immediate state changes plus lightweight press feedback.
+- Text input fields should enter edit mode normally when tapped, then clear focus and hide the cursor/keyboard when the user taps outside input controls.
+- Save actions that close an editor should avoid abrupt disappearance. Prefer showing a short success state, then closing via the existing fade/slide exit timing so the interaction feels buffered and intentional.
 - Cache derived calendar data with `remember`/`derivedStateOf` instead of recalculating filters and sorting during unrelated UI state changes.
 - Calendar builders should pre-group records by date/month instead of repeatedly filtering the full record list for every visible cell.
 - Animation specs should prefer short `FastOutSlowInEasing` tweens, low-amplitude movement, and fade-only exits in scrollable areas. Avoid spring rebound and repeated image decoding during recomposition.
@@ -555,6 +565,7 @@ The current implementation includes the first working NFC tap-to-meet loop:
 - Realtime events are treated as notifications to refresh authoritative backend state, not as client-side proof of friendship or meeting state.
 - When a confirmed meeting event is received, the app refreshes meeting data and shows a lightweight animated floating success notice.
 - When a friend event is received, the app refreshes friend data and shows a lightweight animated floating notice.
+- On app startup, historical realtime events must be used only to establish the latest event baseline and refresh state. They must not show floating notices after the fact; only events created after the current foreground realtime session starts should trigger pop-up notices.
 
 Current Android NFC files:
 

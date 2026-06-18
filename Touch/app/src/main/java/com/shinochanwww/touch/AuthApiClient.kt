@@ -22,14 +22,26 @@ data class AuthenticatedSession(
     val email: String,
     val accessToken: String,
     val refreshToken: String,
-    val avatarUrl: String?
+    val avatarUrl: String?,
+    val bio: String?,
+    val birthday: String?,
+    val gender: String?,
+    val cardBackgroundUrl: String?,
+    val cardBackgroundKey: String?,
+    val lastSeenAt: Long?
 )
 
 data class AccountUser(
     val userId: String,
     val displayName: String,
     val email: String,
-    val avatarUrl: String?
+    val avatarUrl: String?,
+    val bio: String?,
+    val birthday: String?,
+    val gender: String?,
+    val cardBackgroundUrl: String?,
+    val cardBackgroundKey: String?,
+    val lastSeenAt: Long?
 )
 
 data class MeetingRecordDto(
@@ -46,7 +58,13 @@ data class FriendUserDto(
     val userId: String,
     val displayName: String,
     val email: String,
-    val avatarUrl: String?
+    val avatarUrl: String?,
+    val bio: String?,
+    val birthday: String?,
+    val gender: String?,
+    val cardBackgroundUrl: String?,
+    val cardBackgroundKey: String?,
+    val lastSeenAt: Long?
 )
 
 data class FriendshipDto(
@@ -84,7 +102,8 @@ data class MeetingProofResultDto(
 data class RealtimeEventDto(
     val id: Long,
     val type: String,
-    val payload: JSONObject
+    val payload: JSONObject,
+    val createdAt: Long
 )
 
 class AuthApiException(message: String) : Exception(message)
@@ -92,6 +111,7 @@ class AuthApiException(message: String) : Exception(message)
 class RealtimeEventConnection(
     private val baseUrl: String,
     private val accessToken: String,
+    initialLastEventId: Long,
     private val onEvent: (RealtimeEventDto) -> Unit,
     private val onError: (Exception) -> Unit
 ) {
@@ -101,7 +121,7 @@ class RealtimeEventConnection(
     @Volatile
     private var activeConnection: HttpURLConnection? = null
 
-    private var lastEventId = 0L
+    private var lastEventId = initialLastEventId
 
     private val worker = Thread {
         while (!closed) {
@@ -131,7 +151,8 @@ class RealtimeEventConnection(
                                     val event = RealtimeEventDto(
                                         id = json.optLong("id", lastEventId),
                                         type = json.optString("type"),
-                                        payload = json.optJSONObject("payload") ?: JSONObject()
+                                        payload = json.optJSONObject("payload") ?: JSONObject(),
+                                        createdAt = json.optLong("createdAt", 0L)
                                     )
                                     if (event.id > lastEventId) {
                                         lastEventId = event.id
@@ -214,9 +235,57 @@ class AuthApiClient(
         return parseUser(requestWithJson("POST", "/account/me", body, accessToken))
     }
 
+    fun updateProfile(
+        accessToken: String,
+        displayName: String,
+        bio: String,
+        birthday: String,
+        gender: String,
+        cardBackgroundKey: String?
+    ): AccountUser {
+        val body = JSONObject()
+            .put("displayName", displayName)
+            .put("bio", bio)
+            .put("birthday", birthday)
+            .put("gender", gender)
+        if (!cardBackgroundKey.isNullOrBlank()) {
+            body.put("cardBackgroundKey", cardBackgroundKey)
+        }
+        return parseUser(requestWithJson("POST", "/account/me", body, accessToken))
+    }
+
     fun uploadAvatar(context: Context, accessToken: String, imageUri: Uri): AccountUser {
+        return uploadAccountImage(
+            context = context,
+            accessToken = accessToken,
+            imageUri = imageUri,
+            path = "/account/avatar",
+            fieldName = "avatar",
+            filePrefix = "avatar"
+        )
+    }
+
+    fun uploadCardBackground(context: Context, accessToken: String, imageUri: Uri): AccountUser {
+        return uploadAccountImage(
+            context = context,
+            accessToken = accessToken,
+            imageUri = imageUri,
+            path = "/account/card-background",
+            fieldName = "background",
+            filePrefix = "card-background"
+        )
+    }
+
+    private fun uploadAccountImage(
+        context: Context,
+        accessToken: String,
+        imageUri: Uri,
+        path: String,
+        fieldName: String,
+        filePrefix: String
+    ): AccountUser {
         val boundary = "TouchBoundary${UUID.randomUUID().toString().replace("-", "")}"
-        val connection = (URL("$baseUrl/account/avatar").openConnection() as HttpURLConnection).apply {
+        val connection = (URL("$baseUrl$path").openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 10_000
             readTimeout = 10_000
@@ -227,11 +296,11 @@ class AuthApiClient(
         }
 
         val mimeType = context.contentResolver.getType(imageUri) ?: "application/octet-stream"
-        val fileName = "avatar.${mimeType.substringAfterLast("/", "bin")}"
+        val fileName = "$filePrefix.${mimeType.substringAfterLast("/", "bin")}"
         connection.outputStream.use { output ->
             output.write("--$boundary\r\n".toByteArray())
             output.write(
-                "Content-Disposition: form-data; name=\"avatar\"; filename=\"$fileName\"\r\n"
+                "Content-Disposition: form-data; name=\"$fieldName\"; filename=\"$fileName\"\r\n"
                     .toByteArray()
             )
             output.write("Content-Type: $mimeType\r\n\r\n".toByteArray())
@@ -411,12 +480,14 @@ class AuthApiClient(
 
     fun openRealtimeEvents(
         accessToken: String,
+        afterId: Long,
         onEvent: (RealtimeEventDto) -> Unit,
         onError: (Exception) -> Unit
     ): RealtimeEventConnection {
         return RealtimeEventConnection(
             baseUrl = baseUrl,
             accessToken = accessToken,
+            initialLastEventId = afterId,
             onEvent = onEvent,
             onError = onError
         ).also { it.start() }
@@ -506,7 +577,13 @@ class AuthApiClient(
             email = user.getString("email"),
             accessToken = json.getString("accessToken"),
             refreshToken = json.getString("refreshToken"),
-            avatarUrl = user.optString("avatarUrl").takeIf { it.isNotBlank() && it != "null" }
+            avatarUrl = user.optString("avatarUrl").takeIf { it.isNotBlank() && it != "null" },
+            bio = user.optString("bio").takeIf { it.isNotBlank() && it != "null" },
+            birthday = user.optString("birthday").takeIf { it.isNotBlank() && it != "null" },
+            gender = user.optString("gender").takeIf { it.isNotBlank() && it != "null" },
+            cardBackgroundUrl = user.optString("cardBackgroundUrl").takeIf { it.isNotBlank() && it != "null" },
+            cardBackgroundKey = user.optString("cardBackgroundKey").takeIf { it.isNotBlank() && it != "null" },
+            lastSeenAt = user.optLong("lastSeenAt", 0L).takeIf { it > 0L }
         )
     }
 
@@ -516,7 +593,13 @@ class AuthApiClient(
             userId = user.getString("id"),
             displayName = user.getString("displayName"),
             email = user.getString("email"),
-            avatarUrl = user.optString("avatarUrl").takeIf { it.isNotBlank() && it != "null" }
+            avatarUrl = user.optString("avatarUrl").takeIf { it.isNotBlank() && it != "null" },
+            bio = user.optString("bio").takeIf { it.isNotBlank() && it != "null" },
+            birthday = user.optString("birthday").takeIf { it.isNotBlank() && it != "null" },
+            gender = user.optString("gender").takeIf { it.isNotBlank() && it != "null" },
+            cardBackgroundUrl = user.optString("cardBackgroundUrl").takeIf { it.isNotBlank() && it != "null" },
+            cardBackgroundKey = user.optString("cardBackgroundKey").takeIf { it.isNotBlank() && it != "null" },
+            lastSeenAt = user.optLong("lastSeenAt", 0L).takeIf { it > 0L }
         )
     }
 
@@ -537,7 +620,13 @@ class AuthApiClient(
             userId = json.getString("id"),
             displayName = json.getString("displayName"),
             email = json.getString("email"),
-            avatarUrl = json.optString("avatarUrl").takeIf { it.isNotBlank() && it != "null" }
+            avatarUrl = json.optString("avatarUrl").takeIf { it.isNotBlank() && it != "null" },
+            bio = json.optString("bio").takeIf { it.isNotBlank() && it != "null" },
+            birthday = json.optString("birthday").takeIf { it.isNotBlank() && it != "null" },
+            gender = json.optString("gender").takeIf { it.isNotBlank() && it != "null" },
+            cardBackgroundUrl = json.optString("cardBackgroundUrl").takeIf { it.isNotBlank() && it != "null" },
+            cardBackgroundKey = json.optString("cardBackgroundKey").takeIf { it.isNotBlank() && it != "null" },
+            lastSeenAt = json.optLong("lastSeenAt", 0L).takeIf { it > 0L }
         )
     }
 
@@ -576,7 +665,8 @@ class AuthApiClient(
         return RealtimeEventDto(
             id = json.getLong("id"),
             type = json.getString("type"),
-            payload = json.optJSONObject("payload") ?: JSONObject()
+            payload = json.optJSONObject("payload") ?: JSONObject(),
+            createdAt = json.optLong("createdAt", 0L)
         )
     }
 

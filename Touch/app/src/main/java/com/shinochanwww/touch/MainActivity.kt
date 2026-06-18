@@ -87,14 +87,19 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.unit.Velocity
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -198,6 +203,8 @@ private enum class MainTab {
 private const val SWITCH_ANIMATION_MS = 170
 private const val INLINE_ENTER_MS = 120
 private const val INLINE_EXIT_MS = 80
+private const val PROFILE_EDITOR_EXIT_MS = 260
+private const val PROFILE_SAVE_DISMISS_DELAY_MS = 680L
 private const val PRESS_ANIMATION_MS = 85
 private const val DRAG_FEEDBACK_MS = 90
 private const val REBOUND_ANIMATION_MS = 430
@@ -210,7 +217,13 @@ private data class UserSession(
     val email: String,
     val accessToken: String,
     val refreshToken: String,
-    val avatarUrl: String?
+    val avatarUrl: String?,
+    val bio: String?,
+    val birthday: String?,
+    val gender: String?,
+    val cardBackgroundUrl: String?,
+    val cardBackgroundKey: String?,
+    val lastSeenAt: Long?
 )
 
 private object SessionStore {
@@ -229,7 +242,13 @@ private object SessionStore {
                 email = json.getString("email"),
                 accessToken = json.getString("accessToken"),
                 refreshToken = json.getString("refreshToken"),
-                avatarUrl = json.optString("avatarUrl").takeIf { it.isNotBlank() && it != "null" }
+                avatarUrl = json.optString("avatarUrl").takeIf { it.isNotBlank() && it != "null" },
+                bio = json.optString("bio").takeIf { it.isNotBlank() && it != "null" },
+                birthday = json.optString("birthday").takeIf { it.isNotBlank() && it != "null" },
+                gender = json.optString("gender").takeIf { it.isNotBlank() && it != "null" },
+                cardBackgroundUrl = json.optString("cardBackgroundUrl").takeIf { it.isNotBlank() && it != "null" },
+                cardBackgroundKey = json.optString("cardBackgroundKey").takeIf { it.isNotBlank() && it != "null" },
+                lastSeenAt = json.optLong("lastSeenAt", 0L).takeIf { it > 0L }
             )
         }.getOrNull()
     }
@@ -242,6 +261,12 @@ private object SessionStore {
             .put("accessToken", session.accessToken)
             .put("refreshToken", session.refreshToken)
             .put("avatarUrl", session.avatarUrl)
+            .put("bio", session.bio)
+            .put("birthday", session.birthday)
+            .put("gender", session.gender)
+            .put("cardBackgroundUrl", session.cardBackgroundUrl)
+            .put("cardBackgroundKey", session.cardBackgroundKey)
+            .put("lastSeenAt", session.lastSeenAt)
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putString(KEY_SESSION_JSON, json.toString())
@@ -280,7 +305,13 @@ private data class FriendUser(
     val userId: String,
     val displayName: String,
     val email: String,
-    val avatarUrl: String?
+    val avatarUrl: String?,
+    val bio: String?,
+    val birthday: String?,
+    val gender: String?,
+    val cardBackgroundUrl: String?,
+    val cardBackgroundKey: String?,
+    val lastSeenAt: Long?
 )
 
 private data class Friendship(
@@ -504,7 +535,9 @@ private fun AuthScreen(
     val isLogin = mode == AuthMode.Login
 
     Scaffold(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            .clearFocusOnBackgroundTap(),
         containerColor = TouchColors.Background
     ) { innerPadding ->
         Column(
@@ -679,7 +712,13 @@ private fun AuthenticatedSession.toUserSession(): UserSession {
         email = email,
         accessToken = accessToken,
         refreshToken = refreshToken,
-        avatarUrl = avatarUrl
+        avatarUrl = avatarUrl,
+        bio = bio,
+        birthday = birthday,
+        gender = gender,
+        cardBackgroundUrl = cardBackgroundUrl,
+        cardBackgroundKey = cardBackgroundKey,
+        lastSeenAt = lastSeenAt
     )
 }
 
@@ -731,6 +770,8 @@ private fun TouchHomeScreen(
     var realtimeNotice by remember { mutableStateOf<FloatingRealtimeNotice?>(null) }
     var lastRealtimeEventId by remember(session.userId) { mutableStateOf(0L) }
     var realtimeReady by remember(session.userId) { mutableStateOf(false) }
+    var realtimeBaselineReady by remember(session.userId) { mutableStateOf(false) }
+    var realtimeStartedAt by remember(session.userId) { mutableStateOf(0L) }
     val acceptedFriends by remember(friendships) {
         derivedStateOf {
             friendships
@@ -792,6 +833,9 @@ private fun TouchHomeScreen(
         }.start()
     }
     val handleRealtimeEvent: (RealtimeEventDto) -> Unit = { event ->
+        val shouldNotify = realtimeReady &&
+            realtimeStartedAt > 0L &&
+            event.createdAt >= realtimeStartedAt
         if (!realtimeReady) {
             if (event.id > lastRealtimeEventId) {
                 lastRealtimeEventId = event.id
@@ -804,12 +848,14 @@ private fun TouchHomeScreen(
                         ?.optString("displayName")
                         ?.takeIf { it.isNotBlank() }
                         ?: "\u597d\u53cb"
-                    realtimeNotice = FloatingRealtimeNotice(
-                        id = event.id,
-                        title = "\u78b0\u4e00\u78b0\u6210\u529f",
-                        message = "\u548c $peerName \u5df2\u786e\u8ba4\u89c1\u9762",
-                        kind = RealtimeNoticeKind.Meeting
-                    )
+                    if (shouldNotify) {
+                        realtimeNotice = FloatingRealtimeNotice(
+                            id = event.id,
+                            title = "\u78b0\u4e00\u78b0\u6210\u529f",
+                            message = "\u548c $peerName \u5df2\u786e\u8ba4\u89c1\u9762",
+                            kind = RealtimeNoticeKind.Meeting
+                        )
+                    }
                     refreshMeetings()
                 }
                 "friend_request_received" -> {
@@ -817,12 +863,14 @@ private fun TouchHomeScreen(
                         ?.optString("displayName")
                         ?.takeIf { it.isNotBlank() }
                         ?: "\u65b0\u670b\u53cb"
-                    realtimeNotice = FloatingRealtimeNotice(
-                        id = event.id,
-                        title = "\u65b0\u7684\u597d\u53cb\u7533\u8bf7",
-                        message = "$fromName \u60f3\u6dfb\u52a0\u4f60\u4e3a\u597d\u53cb",
-                        kind = RealtimeNoticeKind.Friend
-                    )
+                    if (shouldNotify) {
+                        realtimeNotice = FloatingRealtimeNotice(
+                            id = event.id,
+                            title = "\u65b0\u7684\u597d\u53cb\u7533\u8bf7",
+                            message = "$fromName \u60f3\u6dfb\u52a0\u4f60\u4e3a\u597d\u53cb",
+                            kind = RealtimeNoticeKind.Friend
+                        )
+                    }
                     refreshFriends()
                 }
                 "friend_request_accepted" -> {
@@ -830,12 +878,14 @@ private fun TouchHomeScreen(
                         ?.optString("displayName")
                         ?.takeIf { it.isNotBlank() }
                         ?: "\u5bf9\u65b9"
-                    realtimeNotice = FloatingRealtimeNotice(
-                        id = event.id,
-                        title = "\u597d\u53cb\u7533\u8bf7\u5df2\u901a\u8fc7",
-                        message = "$fromName \u5df2\u6210\u4e3a\u4f60\u7684\u597d\u53cb",
-                        kind = RealtimeNoticeKind.Friend
-                    )
+                    if (shouldNotify) {
+                        realtimeNotice = FloatingRealtimeNotice(
+                            id = event.id,
+                            title = "\u597d\u53cb\u7533\u8bf7\u5df2\u901a\u8fc7",
+                            message = "$fromName \u5df2\u6210\u4e3a\u4f60\u7684\u597d\u53cb",
+                            kind = RealtimeNoticeKind.Friend
+                        )
+                    }
                     refreshFriends()
                 }
                 "friend_request_rejected" -> {
@@ -843,21 +893,25 @@ private fun TouchHomeScreen(
                         ?.optString("displayName")
                         ?.takeIf { it.isNotBlank() }
                         ?: "\u5bf9\u65b9"
-                    realtimeNotice = FloatingRealtimeNotice(
-                        id = event.id,
-                        title = "\u597d\u53cb\u7533\u8bf7\u88ab\u62d2\u7edd",
-                        message = "$fromName \u6ca1\u6709\u901a\u8fc7\u4f60\u7684\u597d\u53cb\u7533\u8bf7",
-                        kind = RealtimeNoticeKind.Friend
-                    )
+                    if (shouldNotify) {
+                        realtimeNotice = FloatingRealtimeNotice(
+                            id = event.id,
+                            title = "\u597d\u53cb\u7533\u8bf7\u88ab\u62d2\u7edd",
+                            message = "$fromName \u6ca1\u6709\u901a\u8fc7\u4f60\u7684\u597d\u53cb\u7533\u8bf7",
+                            kind = RealtimeNoticeKind.Friend
+                        )
+                    }
                     refreshFriends()
                 }
                 "friend_removed" -> {
-                    realtimeNotice = FloatingRealtimeNotice(
-                        id = event.id,
-                        title = "\u597d\u53cb\u72b6\u6001\u5df2\u66f4\u65b0",
-                        message = "\u597d\u53cb\u5217\u8868\u5df2\u540c\u6b65",
-                        kind = RealtimeNoticeKind.Neutral
-                    )
+                    if (shouldNotify) {
+                        realtimeNotice = FloatingRealtimeNotice(
+                            id = event.id,
+                            title = "\u597d\u53cb\u72b6\u6001\u5df2\u66f4\u65b0",
+                            message = "\u597d\u53cb\u5217\u8868\u5df2\u540c\u6b65",
+                            kind = RealtimeNoticeKind.Neutral
+                        )
+                    }
                     refreshFriends()
                     refreshMeetings()
                 }
@@ -872,6 +926,9 @@ private fun TouchHomeScreen(
         refreshFriends()
     }
     LaunchedEffect(session.accessToken) {
+        realtimeReady = false
+        realtimeBaselineReady = false
+        realtimeStartedAt = System.currentTimeMillis() / 1000
         try {
             val existingEvents = withContext(Dispatchers.IO) {
                 authApiClient.getRealtimeEvents(session.accessToken, 0L)
@@ -880,6 +937,7 @@ private fun TouchHomeScreen(
         } catch (_: Exception) {
             lastRealtimeEventId = 0L
         }
+        realtimeBaselineReady = true
         realtimeReady = true
         while (true) {
             delay(2_000)
@@ -895,20 +953,28 @@ private fun TouchHomeScreen(
             }
         }
     }
-    DisposableEffect(session.accessToken) {
-        val connection = authApiClient.openRealtimeEvents(
-            accessToken = session.accessToken,
-            onEvent = { event ->
-                mainHandler.post {
-                    handleRealtimeEvent(event)
+    DisposableEffect(session.accessToken, realtimeBaselineReady) {
+        if (!realtimeBaselineReady) {
+            onDispose {}
+        }
+        val connection = if (realtimeBaselineReady) {
+            authApiClient.openRealtimeEvents(
+                accessToken = session.accessToken,
+                afterId = lastRealtimeEventId,
+                onEvent = { event ->
+                    mainHandler.post {
+                        handleRealtimeEvent(event)
+                    }
+                },
+                onError = {
+                    // The connection retries in the background. Keep UI quiet unless a real event arrives.
                 }
-            },
-            onError = {
-                // The connection retries in the background. Keep UI quiet unless a real event arrives.
-            }
-        )
+            )
+        } else {
+            null
+        }
         onDispose {
-            connection.close()
+            connection?.close()
         }
     }
     LaunchedEffect(realtimeNotice?.id) {
@@ -1002,7 +1068,9 @@ private fun TouchHomeScreen(
     }
 
     Scaffold(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            .clearFocusOnBackgroundTap(),
         containerColor = TouchColors.Background,
         bottomBar = {
             BottomTabBar(
@@ -1044,6 +1112,7 @@ private fun TouchHomeScreen(
                             viewMode = calendarViewMode,
                             detail = detail,
                             friends = acceptedFriends,
+                            authApiClient = authApiClient,
                             selectedFriend = selectedFriendFilter,
                             isFriendFiltered = selectedFriendFilter != null,
                             onFriendFilterChanged = {
@@ -1473,6 +1542,36 @@ private fun AccountPanel(
     onSessionChanged: (UserSession) -> Unit,
     onLogout: () -> Unit
 ) {
+    var previewBackgroundBitmap by remember(session.userId, session.cardBackgroundUrl, session.cardBackgroundKey) {
+        mutableStateOf<Bitmap?>(null)
+    }
+    var previewBackgroundUri by remember(session.userId, session.cardBackgroundUrl, session.cardBackgroundKey) {
+        mutableStateOf<Uri?>(null)
+    }
+    var previewBackgroundKey by remember(session.userId, session.cardBackgroundUrl, session.cardBackgroundKey) {
+        mutableStateOf(session.cardBackgroundKey ?: "mizuki")
+    }
+    var previewUsesDefaultBackground by remember(session.userId, session.cardBackgroundUrl, session.cardBackgroundKey) {
+        mutableStateOf(session.cardBackgroundUrl == null)
+    }
+    LaunchedEffect(isEditing, session.cardBackgroundUrl, session.cardBackgroundKey) {
+        if (!isEditing) {
+            delay(PROFILE_EDITOR_EXIT_MS.toLong() + 80L)
+            previewBackgroundBitmap = null
+            previewBackgroundUri = null
+            previewBackgroundKey = session.cardBackgroundKey ?: "mizuki"
+            previewUsesDefaultBackground = session.cardBackgroundUrl == null
+        }
+    }
+    val displayBackgroundBitmap = if (isEditing) previewBackgroundBitmap else null
+    val displayBackgroundUrl = when {
+        !isEditing -> session.cardBackgroundUrl
+        previewBackgroundBitmap != null -> null
+        previewUsesDefaultBackground -> null
+        else -> session.cardBackgroundUrl
+    }
+    val displayBackgroundKey = if (isEditing) previewBackgroundKey else session.cardBackgroundKey
+
     Card(
         modifier = Modifier
             .fillMaxWidth(),
@@ -1480,56 +1579,90 @@ private fun AccountPanel(
         shape = RoundedCornerShape(8.dp),
         elevation = CardDefaults.cardElevation(defaultElevation = 3.dp)
     ) {
-        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically
+        Column(
+            modifier = Modifier
+                .padding(14.dp)
+                .animateContentSize(
+                    animationSpec = tween(240, easing = FastOutSlowInEasing)
+                ),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(154.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .cuteClickable { onEditingChange(!isEditing) }
             ) {
-                AccountAvatar(
-                    name = session.displayName,
-                    bitmap = avatarBitmap,
-                    modifier = Modifier.cuteClickable { onEditingChange(!isEditing) }
+                ProfileCardBackground(
+                    imageUrl = displayBackgroundUrl,
+                    backgroundKey = displayBackgroundKey,
+                    previewBitmap = displayBackgroundBitmap,
+                    authApiClient = authApiClient,
+                    modifier = Modifier.fillMaxSize()
                 )
-                Spacer(modifier = Modifier.width(12.dp))
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.14f))
+                )
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = session.displayName,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = TouchColors.TextStrong,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Text(
-                        text = session.email,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = TouchColors.TextMuted
-                    )
-                    Text(
-                        text = "\u70b9\u51fb\u5934\u50cf\u7f16\u8f91\u8d44\u6599",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = TouchColors.TextMuted
-                    )
+                    AccountAvatar(name = session.displayName, bitmap = avatarBitmap)
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        Text(
+                            text = session.displayName,
+                            style = MaterialTheme.typography.titleLarge,
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = session.bio ?: "\u70b9\u51fb\u7f16\u8f91\u4e2a\u4eba\u540d\u7247",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color.White.copy(alpha = 0.86f),
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
-                TextButton(onClick = onLogout, colors = touchDangerTextButtonColors()) {
-                    Text(
-                        text = "\u9000\u51fa",
-                        color = TouchColors.Error,
-                        fontWeight = FontWeight.SemiBold
-                    )
+                TextButton(
+                    onClick = onLogout,
+                    colors = ButtonDefaults.textButtonColors(contentColor = Color.White),
+                    modifier = Modifier.align(Alignment.TopEnd)
+                ) {
+                    Text("\u9000\u51fa", fontWeight = FontWeight.SemiBold)
                 }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ProfileInfoPill("\u751f\u65e5", session.birthday ?: "\u672a\u8bbe\u7f6e", Modifier.weight(1f))
+                ProfileInfoPill("\u6027\u522b", session.gender ?: "\u672a\u8bbe\u7f6e", Modifier.weight(1f))
+                ProfileInfoPill("\u6700\u540e\u4e0a\u7ebf", formatLastSeen(session.lastSeenAt), Modifier.weight(1f))
             }
             AnimatedVisibility(
                 visible = isEditing,
                 enter = fadeIn(tween(INLINE_ENTER_MS, easing = FastOutSlowInEasing)) +
                     slideInVertically(tween(INLINE_ENTER_MS, easing = FastOutSlowInEasing)) { -it / 18 },
-                exit = fadeOut(tween(INLINE_EXIT_MS, easing = FastOutSlowInEasing))
+                exit = fadeOut(tween(PROFILE_EDITOR_EXIT_MS, easing = FastOutSlowInEasing)) +
+                    slideOutVertically(tween(PROFILE_EDITOR_EXIT_MS, easing = FastOutSlowInEasing)) { -it / 24 }
             ) {
                 AccountEditInline(
                     session = session,
                     onAvatarBitmapChanged = onAvatarBitmapChanged,
                     authApiClient = authApiClient,
                     mainHandler = mainHandler,
+                    selectedBackgroundKey = previewBackgroundKey,
+                    pendingBackgroundUri = previewBackgroundUri,
+                    onBackgroundPreviewChanged = { key, uri, bitmap, usesDefault ->
+                        previewBackgroundKey = key
+                        previewBackgroundUri = uri
+                        previewBackgroundBitmap = bitmap
+                        previewUsesDefaultBackground = usesDefault
+                    },
                     onSessionChanged = onSessionChanged,
                     onDismiss = { onEditingChange(false) }
                 )
@@ -1544,11 +1677,17 @@ private fun AccountEditInline(
     onAvatarBitmapChanged: (Bitmap?) -> Unit,
     authApiClient: AuthApiClient,
     mainHandler: Handler,
+    selectedBackgroundKey: String,
+    pendingBackgroundUri: Uri?,
+    onBackgroundPreviewChanged: (String, Uri?, Bitmap?, Boolean) -> Unit,
     onSessionChanged: (UserSession) -> Unit,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
     var draftName by remember(session.displayName) { mutableStateOf(session.displayName) }
+    var draftBio by remember(session.bio) { mutableStateOf(session.bio.orEmpty()) }
+    var draftBirthday by remember(session.birthday) { mutableStateOf(session.birthday.orEmpty()) }
+    var draftGender by remember(session.gender) { mutableStateOf(session.gender ?: "\u4fdd\u5bc6") }
     var statusText by remember { mutableStateOf<String?>(null) }
     var isSaving by remember { mutableStateOf(false) }
     val avatarButtonInteraction = remember { MutableInteractionSource() }
@@ -1568,7 +1707,7 @@ private fun AccountEditInline(
                         onSessionChanged(session.withAccountUser(updated))
                         isSaving = false
                         statusText = "\u5934\u50cf\u5df2\u66f4\u65b0"
-                        onDismiss()
+                        mainHandler.postDelayed({ onDismiss() }, PROFILE_SAVE_DISMISS_DELAY_MS)
                     }
                 } catch (error: Exception) {
                     mainHandler.post {
@@ -1577,6 +1716,13 @@ private fun AccountEditInline(
                     }
                 }
             }.start()
+        }
+    }
+    val backgroundPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        if (uri != null) {
+            val decoded = decodeBitmapFromUri(context, uri)
+            onBackgroundPreviewChanged(selectedBackgroundKey, uri, decoded, false)
+            statusText = "\u80cc\u666f\u5df2\u9884\u89c8\uff0c\u70b9\u51fb\u4fdd\u5b58\u540e\u4e0a\u4f20"
         }
     }
 
@@ -1591,6 +1737,61 @@ private fun AccountEditInline(
             label = { Text("\u6635\u79f0") },
             singleLine = true
         )
+        OutlinedTextField(
+            value = draftBio,
+            onValueChange = {
+                draftBio = it.take(160)
+                statusText = null
+            },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("\u4e2a\u4eba\u7b80\u4ecb") },
+            minLines = 2,
+            maxLines = 3
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            OutlinedTextField(
+                value = draftBirthday,
+                onValueChange = {
+                    draftBirthday = it.take(10)
+                    statusText = null
+                },
+                modifier = Modifier.weight(1f),
+                label = { Text("\u751f\u65e5") },
+                placeholder = { Text("YYYY-MM-DD") },
+                singleLine = true
+            )
+            OutlinedTextField(
+                value = draftGender,
+                onValueChange = {
+                    draftGender = it.take(8)
+                    statusText = null
+                },
+                modifier = Modifier.weight(1f),
+                label = { Text("\u6027\u522b") },
+                placeholder = { Text("\u7537/\u5973/\u5176\u4ed6/\u4fdd\u5bc6") },
+                singleLine = true
+            )
+        }
+        Text(
+            text = "\u540d\u7247\u80cc\u666f",
+            style = MaterialTheme.typography.labelLarge,
+            color = TouchColors.TextStrong,
+            fontWeight = FontWeight.SemiBold
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            DefaultCardBackgroundChip("\u6c34\u6708", "mizuki", selectedBackgroundKey, Modifier.weight(1f)) {
+                onBackgroundPreviewChanged("mizuki", null, null, true)
+                statusText = null
+            }
+            DefaultCardBackgroundChip("\u7f2a\u5c14\u585e\u65af", "muelsyse", selectedBackgroundKey, Modifier.weight(1f)) {
+                onBackgroundPreviewChanged("muelsyse", null, null, true)
+                statusText = null
+            }
+            DefaultCardBackgroundChip("\u9ecd", "shu", selectedBackgroundKey, Modifier.weight(1f)) {
+                onBackgroundPreviewChanged("shu", null, null, true)
+                statusText = null
+            }
+        }
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -1610,6 +1811,20 @@ private fun AccountEditInline(
             ) {
                 Text("\u66f4\u6362\u5934\u50cf")
             }
+            OutlinedButton(
+                onClick = { backgroundPicker.launch("image/*") },
+                enabled = !isSaving,
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(8.dp),
+                colors = touchOutlinedButtonColors()
+            ) {
+                Text("\u4e0a\u4f20\u80cc\u666f")
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
             Button(
                 onClick = {
                     val nextName = draftName.trim()
@@ -1620,12 +1835,24 @@ private fun AccountEditInline(
                         statusText = "\u6b63\u5728\u4fdd\u5b58..."
                         Thread {
                             try {
-                                val updated = authApiClient.updateDisplayName(session.accessToken, nextName)
+                                val backgroundUpdated = if (pendingBackgroundUri != null) {
+                                    authApiClient.uploadCardBackground(context, session.accessToken, pendingBackgroundUri)
+                                } else {
+                                    null
+                                }
+                                val updated = authApiClient.updateProfile(
+                                    accessToken = session.accessToken,
+                                    displayName = nextName,
+                                    bio = draftBio.trim(),
+                                    birthday = draftBirthday.trim(),
+                                    gender = draftGender.trim(),
+                                    cardBackgroundKey = if (pendingBackgroundUri == null) selectedBackgroundKey else null
+                                )
                                 mainHandler.post {
-                                    onSessionChanged(session.withAccountUser(updated))
+                                    onSessionChanged(session.withAccountUser(backgroundUpdated ?: updated).withAccountUser(updated))
                                     isSaving = false
                                     statusText = "\u8d44\u6599\u5df2\u4fdd\u5b58"
-                                    onDismiss()
+                                    mainHandler.postDelayed({ onDismiss() }, PROFILE_SAVE_DISMISS_DELAY_MS)
                                 }
                             } catch (error: Exception) {
                                 mainHandler.post {
@@ -1639,7 +1866,7 @@ private fun AccountEditInline(
                 enabled = !isSaving,
                 interactionSource = saveButtonInteraction,
                 modifier = Modifier
-                    .weight(1f)
+                    .fillMaxWidth()
                     .graphicsLayer {
                         scaleX = saveButtonScale
                         scaleY = saveButtonScale
@@ -1669,8 +1896,168 @@ private fun UserSession.withAccountUser(user: AccountUser): UserSession {
         userId = user.userId,
         displayName = user.displayName,
         email = user.email,
-        avatarUrl = user.avatarUrl
+        avatarUrl = user.avatarUrl,
+        bio = user.bio,
+        birthday = user.birthday,
+        gender = user.gender,
+        cardBackgroundUrl = user.cardBackgroundUrl,
+        cardBackgroundKey = user.cardBackgroundKey,
+        lastSeenAt = user.lastSeenAt
     )
+}
+
+@Composable
+private fun ProfileInfoPill(label: String, value: String, modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier,
+        color = TouchColors.DetailSurface,
+        shape = RoundedCornerShape(8.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 9.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = TouchColors.TextMuted,
+                maxLines = 1
+            )
+            Text(
+                text = value,
+                style = MaterialTheme.typography.labelMedium,
+                color = TouchColors.TextStrong,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
+private fun DefaultCardBackgroundChip(
+    label: String,
+    key: String,
+    selectedKey: String,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    val selected = key == selectedKey
+    Surface(
+        modifier = modifier
+            .height(38.dp)
+            .cuteClickable(onClick = onClick),
+        color = if (selected) TouchColors.SuccessSoft else TouchColors.CalendarTile,
+        shape = RoundedCornerShape(8.dp)
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = if (selected) TouchColors.PrimaryDark else TouchColors.TextMuted,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+@Composable
+private fun ProfileCardBackground(
+    imageUrl: String?,
+    backgroundKey: String?,
+    previewBitmap: Bitmap? = null,
+    authApiClient: AuthApiClient,
+    modifier: Modifier = Modifier
+) {
+    var bitmap by remember(imageUrl) { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(imageUrl) {
+        if (imageUrl == null) {
+            bitmap = null
+        } else {
+            Thread {
+                val loaded = runCatching { authApiClient.loadAvatarBitmap(imageUrl) }.getOrNull()
+                Handler(Looper.getMainLooper()).post {
+                    bitmap = loaded
+                }
+            }.start()
+        }
+    }
+    Box(modifier = modifier.background(defaultCardBackgroundColor(backgroundKey))) {
+        if (previewBitmap != null) {
+            Image(
+                bitmap = previewBitmap.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        } else if (bitmap != null) {
+            Image(
+                bitmap = bitmap!!.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        } else {
+            DefaultCardBackgroundCanvas(backgroundKey = backgroundKey, modifier = Modifier.fillMaxSize())
+        }
+    }
+}
+
+@Composable
+private fun DefaultCardBackgroundCanvas(backgroundKey: String?, modifier: Modifier = Modifier) {
+    val base = defaultCardBackgroundColor(backgroundKey)
+    val accent = when (backgroundKey) {
+        "muelsyse" -> Color(0xFF9DE5D5)
+        "shu" -> Color(0xFFE5C15A)
+        else -> Color(0xFF8FC7FF)
+    }
+    val deep = when (backgroundKey) {
+        "muelsyse" -> Color(0xFF267B72)
+        "shu" -> Color(0xFF7F9F56)
+        else -> Color(0xFF5E87D6)
+    }
+    Canvas(modifier = modifier.background(base)) {
+        drawCircle(
+            color = accent.copy(alpha = 0.48f),
+            radius = size.maxDimension * 0.42f,
+            center = Offset(size.width * 0.18f, size.height * 0.1f)
+        )
+        drawCircle(
+            color = deep.copy(alpha = 0.28f),
+            radius = size.maxDimension * 0.36f,
+            center = Offset(size.width * 0.92f, size.height * 0.88f)
+        )
+        repeat(6) { index ->
+            drawCircle(
+                color = Color.White.copy(alpha = 0.12f),
+                radius = size.minDimension * (0.06f + index * 0.012f),
+                center = Offset(size.width * (0.18f + index * 0.13f), size.height * (0.68f - index * 0.07f))
+            )
+        }
+    }
+}
+
+private fun defaultCardBackgroundColor(backgroundKey: String?): Color {
+    return when (backgroundKey) {
+        "muelsyse" -> Color(0xFFBFEFE5)
+        "shu" -> Color(0xFFF3E5A7)
+        else -> Color(0xFFC9DFFF)
+    }
+}
+
+private fun formatLastSeen(lastSeenAt: Long?): String {
+    if (lastSeenAt == null || lastSeenAt <= 0L) return "\u672a\u77e5"
+    val now = System.currentTimeMillis() / 1000
+    val delta = (now - lastSeenAt).coerceAtLeast(0)
+    return when {
+        delta < 90 -> "\u521a\u521a"
+        delta < 3600 -> "${delta / 60}\u5206\u949f\u524d"
+        delta < 86_400 -> "${delta / 3600}\u5c0f\u65f6\u524d"
+        else -> "${delta / 86_400}\u5929\u524d"
+    }
 }
 
 private fun decodeBitmapFromUri(context: android.content.Context, uri: Uri): Bitmap? {
@@ -1743,6 +2130,18 @@ private fun Modifier.cuteClickable(
             indication = null,
             onClick = onClick
         )
+}
+
+@Composable
+private fun Modifier.clearFocusOnBackgroundTap(): Modifier {
+    val focusManager = LocalFocusManager.current
+    return pointerInput(Unit) {
+        awaitEachGesture {
+            awaitFirstDown(pass = PointerEventPass.Initial)
+            focusManager.clearFocus(force = true)
+            waitForUpOrCancellation(pass = PointerEventPass.Final)
+        }
+    }
 }
 
 @Composable
@@ -2163,6 +2562,7 @@ private fun FriendManagementScreen(
         }
         item(key = "friend-search") {
             Card(
+                modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = TouchColors.Surface),
                 shape = RoundedCornerShape(8.dp),
                 elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
@@ -2177,14 +2577,20 @@ private fun FriendManagementScreen(
                         color = TouchColors.TextStrong,
                         fontWeight = FontWeight.Bold
                     )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         OutlinedTextField(
                             value = searchText,
                             onValueChange = {
                                 searchText = it
                                 statusText = null
                             },
-                            modifier = Modifier.weight(1f),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(56.dp),
                             label = { Text("\u7528\u6237\u540d") },
                             singleLine = true
                         )
@@ -2213,6 +2619,7 @@ private fun FriendManagementScreen(
                                 }
                             },
                             enabled = !isBusy,
+                            modifier = Modifier.height(56.dp),
                             shape = RoundedCornerShape(8.dp),
                             colors = primaryButtonColors
                         ) {
@@ -2400,6 +2807,7 @@ private fun FriendSection(
     content: @Composable () -> Unit
 ) {
     Card(
+        modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = TouchColors.Surface),
         shape = RoundedCornerShape(8.dp),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
@@ -2556,25 +2964,64 @@ private fun FriendCardDialog(
             elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
         ) {
             Column(
-                modifier = Modifier.padding(18.dp),
+                modifier = Modifier.padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    FriendAvatar(user = friend, authApiClient = authApiClient)
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = remark.ifBlank { friend.displayName },
-                            style = MaterialTheme.typography.titleLarge,
-                            color = TouchColors.TextStrong,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            text = friend.displayName,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = TouchColors.TextMuted
-                        )
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(172.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                ) {
+                    ProfileCardBackground(
+                        imageUrl = friend.cardBackgroundUrl,
+                        backgroundKey = friend.cardBackgroundKey,
+                        authApiClient = authApiClient,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black.copy(alpha = 0.16f))
+                    )
+                    Row(
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        FriendAvatar(user = friend, authApiClient = authApiClient)
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = remark.ifBlank { friend.displayName },
+                                style = MaterialTheme.typography.titleLarge,
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = friend.displayName,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Color.White.copy(alpha = 0.86f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                     }
+                }
+                if (!friend.bio.isNullOrBlank()) {
+                    Text(
+                        text = friend.bio,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TouchColors.TextStrong
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ProfileInfoPill("\u751f\u65e5", friend.birthday ?: "\u672a\u8bbe\u7f6e", Modifier.weight(1f))
+                    ProfileInfoPill("\u6027\u522b", friend.gender ?: "\u672a\u8bbe\u7f6e", Modifier.weight(1f))
+                    ProfileInfoPill("\u4e0a\u7ebf", formatLastSeen(friend.lastSeenAt), Modifier.weight(1f))
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FriendStatPill("\u8fd1\u4e00\u5468", weekCount, Modifier.weight(1f))
@@ -2755,6 +3202,7 @@ private fun MeetingCalendar(
     viewMode: CalendarViewMode,
     detail: CalendarDetail?,
     friends: List<FriendUser>,
+    authApiClient: AuthApiClient,
     selectedFriend: FriendUser?,
     isFriendFiltered: Boolean,
     onFriendFilterChanged: (FriendUser?) -> Unit,
@@ -2965,6 +3413,8 @@ private fun MeetingCalendar(
                     when (viewMode) {
                         CalendarViewMode.Week -> WeekCalendarView(
                             calendarMeetings = calendarMeetings,
+                            friends = friends,
+                            authApiClient = authApiClient,
                             onDaySelected = onDaySelected,
                             onDayLongPressed = onDayLongPressed,
                             onRangeSwipe = onRangeSwipe
@@ -2989,6 +3439,8 @@ private fun MeetingCalendar(
                 detail?.let {
                     CalendarDetailPanel(
                         detail = it,
+                        friends = friends,
+                        authApiClient = authApiClient,
                         modifier = Modifier.pointerInput(it) {
                             detectTapGestures { onClearDetail() }
                         }
@@ -3040,6 +3492,8 @@ private fun CalendarModeButton(
 @Composable
 private fun WeekCalendarView(
     calendarMeetings: List<CalendarMeeting>,
+    friends: List<FriendUser>,
+    authApiClient: AuthApiClient,
     onDaySelected: (String, List<MeetingRecord>) -> Unit,
     onDayLongPressed: (String, List<MeetingRecord>) -> Unit,
     onRangeSwipe: (Int) -> Unit
@@ -3172,6 +3626,8 @@ private fun WeekCalendarView(
         calendarMeetings.forEach { day ->
             CalendarDayCard(
                 meeting = day,
+                friends = friends,
+                authApiClient = authApiClient,
                 onClick = { onDaySelected(day.date, day.records) },
                 onLongClick = { onDayLongPressed(day.date, day.records) },
                 modifier = Modifier.width(76.dp)
@@ -3358,8 +3814,11 @@ private fun YearMonthCell(
 @Composable
 private fun CalendarDetailPanel(
     detail: CalendarDetail,
+    friends: List<FriendUser>,
+    authApiClient: AuthApiClient,
     modifier: Modifier = Modifier
 ) {
+    val friendsById = remember(friends) { friends.associateBy { it.userId } }
     Surface(
         modifier = modifier.fillMaxWidth(),
         color = TouchColors.DetailSurface,
@@ -3394,12 +3853,26 @@ private fun CalendarDetailPanel(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                text = record.personName,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = TouchColors.TextStrong,
-                                fontWeight = FontWeight.SemiBold
-                            )
+                            Row(
+                                modifier = Modifier.weight(1f),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = record.personName,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = TouchColors.TextStrong,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                MeetingFriendAvatar(
+                                    record = record,
+                                    friend = record.personUserId?.let { friendsById[it] },
+                                    authApiClient = authApiClient,
+                                    size = 24
+                                )
+                            }
                             Text(
                                 text = "${formatDateLabel(record.metDate)} ${record.metTime}",
                                 style = MaterialTheme.typography.bodySmall,
@@ -3484,6 +3957,7 @@ private fun DayDetailDialog(
         ) {
             Column(
                 modifier = Modifier
+                    .clearFocusOnBackgroundTap()
                     .padding(18.dp)
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
@@ -3857,6 +4331,7 @@ private fun EventEditDialog(
         ) {
             Column(
                 modifier = Modifier
+                    .clearFocusOnBackgroundTap()
                     .padding(18.dp)
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
@@ -3909,7 +4384,8 @@ private fun EventEditDialog(
                                     ).toDayEvent()
                                     mainHandler.post {
                                         isSaving = false
-                                        onUpdated(updated)
+                                        statusText = "\u4e8b\u4ef6\u5df2\u66f4\u65b0"
+                                        mainHandler.postDelayed({ onUpdated(updated) }, 420)
                                     }
                                 } catch (error: Exception) {
                                     mainHandler.post {
@@ -4572,7 +5048,13 @@ private fun FriendUserDto.toFriendUser(): FriendUser {
         userId = userId,
         displayName = displayName,
         email = email,
-        avatarUrl = avatarUrl
+        avatarUrl = avatarUrl,
+        bio = bio,
+        birthday = birthday,
+        gender = gender,
+        cardBackgroundUrl = cardBackgroundUrl,
+        cardBackgroundKey = cardBackgroundKey,
+        lastSeenAt = lastSeenAt
     )
 }
 
@@ -4612,10 +5094,16 @@ private fun meetingHeatColor(count: Int): Color {
 @Composable
 private fun CalendarDayCard(
     meeting: CalendarMeeting,
+    friends: List<FriendUser>,
+    authApiClient: AuthApiClient,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val friendsById = remember(friends) { friends.associateBy { it.userId } }
+    val avatarRecords = remember(meeting.records, friends) {
+        meeting.records.distinctBy { it.personUserId ?: it.personName }.take(3)
+    }
     Surface(
         modifier = modifier
             .height(122.dp)
@@ -4666,26 +5154,97 @@ private fun CalendarDayCard(
                         overflow = TextOverflow.Clip
                     )
                 } else {
-                    meeting.records.take(2).forEach { record ->
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy((-5).dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        avatarRecords.forEach { record ->
+                            MeetingFriendAvatar(
+                                record = record,
+                                friend = record.personUserId?.let { friendsById[it] },
+                                authApiClient = authApiClient,
+                                size = 24
+                            )
+                        }
+                    }
+                    if (meeting.records.isNotEmpty()) {
                         Text(
-                            text = record.personName,
+                            text = "${meeting.records.size}\u6b21",
                             style = MaterialTheme.typography.labelSmall,
-                            color = TouchColors.TextStrong,
-                            fontWeight = FontWeight.Medium,
+                            color = TouchColors.TextMuted,
                             maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            overflow = TextOverflow.Clip
                         )
                     }
                 }
-                if (meeting.records.size > 2) {
+                if (avatarRecords.size < meeting.records.distinctBy { it.personUserId ?: it.personName }.size) {
                     Text(
-                        text = "+${meeting.records.size - 2}",
+                        text = "+${meeting.records.distinctBy { it.personUserId ?: it.personName }.size - avatarRecords.size}",
                         style = MaterialTheme.typography.labelSmall,
                         color = TouchColors.TextMuted,
                         maxLines = 1,
                         overflow = TextOverflow.Clip
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MeetingFriendAvatar(
+    record: MeetingRecord,
+    friend: FriendUser?,
+    authApiClient: AuthApiClient,
+    size: Int
+) {
+    val displayName = friend?.displayName ?: record.personName
+    var avatarBitmap by remember(friend?.userId, friend?.avatarUrl) { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(friend?.userId, friend?.avatarUrl) {
+        val avatarUrl = friend?.avatarUrl
+        if (avatarUrl == null) {
+            avatarBitmap = null
+        } else {
+            Thread {
+                val loaded = runCatching { authApiClient.loadAvatarBitmap(avatarUrl) }.getOrNull()
+                Handler(Looper.getMainLooper()).post {
+                    avatarBitmap = loaded
+                }
+            }.start()
+        }
+    }
+    Box(
+        modifier = Modifier
+            .size(size.dp)
+            .clip(CircleShape)
+            .background(TouchColors.Surface)
+            .padding(1.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        if (avatarBitmap != null) {
+            Image(
+                bitmap = avatarBitmap!!.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(CircleShape),
+                contentScale = ContentScale.Crop
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(CircleShape)
+                    .background(TouchColors.Avatar),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = displayName.take(1).ifBlank { "T" },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center
+                )
             }
         }
     }
@@ -5455,7 +6014,13 @@ private fun TouchHomeScreenPreview() {
                 email = "chenlin@example.com",
                 accessToken = "preview_access",
                 refreshToken = "preview_refresh",
-                avatarUrl = null
+                avatarUrl = null,
+                bio = "喜欢记录偶遇。",
+                birthday = "2003-05-30",
+                gender = "保密",
+                cardBackgroundUrl = null,
+                cardBackgroundKey = "mizuki",
+                lastSeenAt = null
             ),
             authApiClient = AuthApiClient(),
             mainHandler = Handler(Looper.getMainLooper()),
