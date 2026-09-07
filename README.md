@@ -1,25 +1,48 @@
 # Touch
 
-Touch is an Android app for recording real-world "tap-to-meet" interactions, managing friends and profiles, tracking calendar-based meeting history, and collecting staged badges. The repository also includes a lightweight Python backend for local development and device testing.
+Touch is a mobile app for people who want a cleaner way to remember real meetings, keep friend relationships organized, and turn everyday interactions into something more vivid.
 
-## What is included
+It combines:
 
-- `Touch/`: Android client written in Kotlin and Jetpack Compose.
-- `TouchBackend/`: local Python backend used for login, friends, meetings, badges, and event storage during development.
-- `SECURITY_STRATEGY.md`: security roadmap and data-handling rules.
-- `AGENTS.md`: persistent project specification for future code changes.
+- NFC-based tap-to-meet recording
+- Friend management and profile cards
+- Calendar views for meeting history
+- Staged badges for long-term interaction progress
+- Local note photo packaging into shareable ZIP files
+
+## What Touch feels like
+
+Touch is designed to be:
+
+- Fast to use
+- Friendly on the eyes
+- Easy to understand at a glance
+- Built around real social interactions, not empty checklists
 
 ## Main features
 
-- Account registration and login.
-- NFC tap-to-meet flow with backend confirmation.
-- Friend search, requests, remarks, blocking, and removal.
-- Calendar views for week, month, and year meeting history.
-- Personal profile card editing with avatar and background image uploads.
-- Staged badge collection system.
-- Local note photo transfer: select images on the phone, package them into a zip, then share or save it locally.
+- Register and log in to your account
+- Record a meeting by tapping two phones together
+- Search, add, remove, block, and remark friends
+- Browse meeting history by week, month, or year
+- Edit your profile card with avatar, bio, birthday, gender, and background
+- Collect badges that grow through repeated interaction
+- Package classroom note photos into a ZIP on your phone and share or save them locally
 
-## Development setup
+## Who it is for
+
+Touch is aimed at users who want:
+
+- A lightweight social memory log
+- A private friend-based interaction record
+- A visually polished calendar and badge experience
+- A practical phone tool for note photo organization
+
+## Try it locally
+
+### Android app
+
+Open `Touch/` in Android Studio and run it on an emulator or phone.
 
 ### Backend
 
@@ -28,24 +51,13 @@ cd TouchBackend
 python .\server.py
 ```
 
-The backend is for development and testing. It is not production hardened.
+The backend is for development and testing.
 
-### Android app
+## Chinese version
 
-Open `Touch/` in Android Studio and run it on an emulator or device. The app is currently wired for local development and testing against the backend.
+- [中文说明](README.zh-CN.md)
 
-## Public release notes
-
-This repository is kept public-friendly by excluding runtime data, secrets, local databases, build outputs, and private environment files from Git.
-
-Production deployment still requires:
-
-- HTTPS-only API hosting.
-- Keystore-backed session storage on Android.
-- Hardened upload handling.
-- Device-signature NFC proof validation.
-
-## Documentation
+## More docs
 
 - [Backend README](TouchBackend/README.md)
 - [Security strategy](SECURITY_STRATEGY.md)
