@@ -23,11 +23,7 @@ For an Android emulator, use:
 http://10.0.2.2:8000
 ```
 
-For a physical phone on the same Wi-Fi, use the PC LAN IP:
-
-```text
-http://<your-pc-ip>:8000
-```
+For a physical phone on the same Wi-Fi, use the PC LAN IP or a tunnel URL.
 
 ## Endpoints
 
@@ -45,17 +41,19 @@ GET  /meetings
 POST /devices/register
 ```
 
-## Seed Account
+## Demo Data
 
-On startup, the local backend ensures this development account exists:
+Optional demo data can be enabled with environment variables before startup. When disabled, the backend starts with an empty user table unless you register accounts manually.
 
-```text
-email: test@163.com
-password: 12345678
-display name: Shinochanwww
+Example:
+
+```powershell
+$env:TOUCH_ENABLE_DEMO_DATA="1"
+$env:TOUCH_DEMO_EMAIL="demo@example.com"
+$env:TOUCH_DEMO_DISPLAY_NAME="Demo User"
+$env:TOUCH_DEMO_PASSWORD="change-me-now"
+python .\server.py
 ```
-
-Demo meeting records are stored under this account and returned by `GET /meetings`.
 
 ## Security Position
 

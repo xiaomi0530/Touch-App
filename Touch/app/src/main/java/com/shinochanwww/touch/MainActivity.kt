@@ -1,6 +1,7 @@
 package com.shinochanwww.touch
 
 import android.content.Context
+import android.content.Intent
 import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.nfc.tech.IsoDep
@@ -17,6 +18,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.FileProvider
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
@@ -47,10 +49,12 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
@@ -104,12 +108,14 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.foundation.text.KeyboardOptions
 import com.shinochanwww.touch.ui.theme.TouchTheme
@@ -121,7 +127,22 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.IOException
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
+import java.util.zip.Deflater
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+import kotlin.math.abs
+
+private const val NFC_READER_FLAGS =
+    NfcAdapter.FLAG_READER_NFC_A or
+        NfcAdapter.FLAG_READER_NFC_B or
+        NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK or
+        NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS
+private const val NOTE_PHOTO_MAX_BYTES = 5 * 1024 * 1024
 
 class MainActivity : ComponentActivity() {
     private val nfcAdapter: NfcAdapter? by lazy { NfcAdapter.getDefaultAdapter(this) }
@@ -139,6 +160,7 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         super.onPause()
         setNfcReaderMode(false, {}, {})
+        NfcTapService.clearPayload()
     }
 
     fun hasNfc(): Boolean = nfcAdapter != null
@@ -173,6 +195,7 @@ class MainActivity : ComponentActivity() {
                             if (payload == null) {
                                 onError("\u5bf9\u65b9\u5c1a\u672a\u51c6\u5907\u597d\u78b0\u4e00\u78b0")
                             } else {
+                                adapter.disableReaderMode(this)
                                 onPayload(payload)
                             }
                         }
@@ -183,8 +206,10 @@ class MainActivity : ComponentActivity() {
                     runOnUiThread { onError(error.message ?: "\u8bfb\u53d6 NFC \u5931\u8d25") }
                 }
             },
-            NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,
-            null
+            NFC_READER_FLAGS,
+            Bundle().apply {
+                putInt(NfcAdapter.EXTRA_READER_PRESENCE_CHECK_DELAY, 250)
+            }
         )
     }
 }
@@ -197,6 +222,8 @@ private enum class AuthMode {
 private enum class MainTab {
     Home,
     Friends,
+    Achievements,
+    Transfer,
     Mine
 }
 
@@ -304,7 +331,7 @@ private data class MeetingRecord(
 private data class FriendUser(
     val userId: String,
     val displayName: String,
-    val email: String,
+    val email: String?,
     val avatarUrl: String?,
     val bio: String?,
     val birthday: String?,
@@ -333,6 +360,43 @@ private data class DayEvent(
     val participants: List<FriendUser>
 )
 
+private data class AchievementSummary(
+    val unlocked: Int = 0,
+    val total: Int = 0,
+    val personalUnlocked: Int = 0,
+    val friendUnlocked: Int = 0,
+    val highestLevel: Int = 0
+)
+
+private data class Achievement(
+    val code: String,
+    val type: String,
+    val title: String,
+    val description: String,
+    val rarity: String,
+    val progress: Int,
+    val target: Int,
+    val unlocked: Boolean,
+    val unlockedAt: Long?,
+    val friend: FriendUser?,
+    val level: Int,
+    val maxLevel: Int,
+    val stageTitle: String,
+    val nextTarget: Int?,
+    val upgradedAt: Long?
+)
+
+private data class AchievementState(
+    val summary: AchievementSummary = AchievementSummary(),
+    val personal: List<Achievement> = emptyList(),
+    val friendAchievements: List<Achievement> = emptyList()
+)
+
+private data class FriendAchievementGroup(
+    val friend: FriendUser,
+    val achievements: List<Achievement>
+)
+
 private data class PendingFriendPrompt(
     val user: FriendUser,
     val friendship: Friendship?
@@ -348,6 +412,7 @@ private data class FloatingRealtimeNotice(
 private enum class RealtimeNoticeKind {
     Meeting,
     Friend,
+    Achievement,
     Neutral
 }
 
@@ -396,6 +461,7 @@ private enum class CalendarDetailMode {
 }
 
 private enum class TapDialogMode {
+    Unified,
     ShowMine,
     ScanOther
 }
@@ -749,6 +815,8 @@ private fun TouchHomeScreen(
     var meetingLoadError by remember { mutableStateOf<String?>(null) }
     var friendships by remember { mutableStateOf<List<Friendship>>(emptyList()) }
     var friendLoadError by remember { mutableStateOf<String?>(null) }
+    var achievementState by remember { mutableStateOf(AchievementState()) }
+    var achievementLoadError by remember { mutableStateOf<String?>(null) }
     var selectedFriendFilter by remember { mutableStateOf<FriendUser?>(null) }
     var selectedMainTab by remember { mutableStateOf(MainTab.Home) }
     var pendingFriendPrompt by remember { mutableStateOf<PendingFriendPrompt?>(null) }
@@ -768,6 +836,7 @@ private fun TouchHomeScreen(
     var isScanningTap by remember { mutableStateOf(false) }
     var tapDialogMode by remember { mutableStateOf<TapDialogMode?>(null) }
     var realtimeNotice by remember { mutableStateOf<FloatingRealtimeNotice?>(null) }
+    var localNoticeId by remember { mutableStateOf(-1L) }
     var lastRealtimeEventId by remember(session.userId) { mutableStateOf(0L) }
     var realtimeReady by remember(session.userId) { mutableStateOf(false) }
     var realtimeBaselineReady by remember(session.userId) { mutableStateOf(false) }
@@ -831,6 +900,42 @@ private fun TouchHomeScreen(
                 }
             }
         }.start()
+    }
+    val refreshAchievements = {
+        Thread {
+            try {
+                val loaded = authApiClient.getAchievements(session.accessToken).toAchievementState()
+                mainHandler.post {
+                    achievementState = loaded
+                    achievementLoadError = null
+                }
+            } catch (error: Exception) {
+                mainHandler.post {
+                    achievementLoadError = error.message ?: "\u6210\u5c31\u52a0\u8f7d\u5931\u8d25"
+                }
+            }
+        }.start()
+    }
+    DisposableEffect(session.userId) {
+        NfcTapService.setPayloadServedListener {
+            mainHandler.post {
+                isScanningTap = false
+                activity?.setNfcReaderMode(false, {}, {})
+                NfcTapService.clearPayload()
+                tapStatusIsError = false
+                tapStatusText = "\u5df2\u88ab\u8bfb\u53d6\uff0c\u6b63\u5728\u7b49\u5f85\u670d\u52a1\u5668\u786e\u8ba4..."
+                localNoticeId -= 1
+                realtimeNotice = FloatingRealtimeNotice(
+                    id = localNoticeId,
+                    title = "\u5df2\u8bfb\u5230 Touch",
+                    message = "\u5bf9\u65b9\u5df2\u8bfb\u53d6\u4f60\u7684\u78b0\u4e00\u78b0\uff0c\u6b63\u5728\u786e\u8ba4",
+                    kind = RealtimeNoticeKind.Neutral
+                )
+            }
+        }
+        onDispose {
+            NfcTapService.setPayloadServedListener(null)
+        }
     }
     val handleRealtimeEvent: (RealtimeEventDto) -> Unit = { event ->
         val shouldNotify = realtimeReady &&
@@ -915,6 +1020,27 @@ private fun TouchHomeScreen(
                     refreshFriends()
                     refreshMeetings()
                 }
+                "achievement_unlocked", "badge_lit", "badge_upgraded" -> {
+                    val badge = event.payload.optJSONObject("badge") ?: event.payload.optJSONObject("achievement")
+                    val title = badge?.optString("title")?.takeIf { it.isNotBlank() } ?: "\u65b0\u5fbd\u7ae0"
+                    val rarity = badge?.optString("rarity")?.takeIf { it.isNotBlank() } ?: "special"
+                    val level = badge?.optInt("level", 0) ?: 0
+                    val stage = badge?.optString("stageTitle")?.takeIf { it.isNotBlank() } ?: achievementRarityLabel(rarity)
+                    val noticeTitle = if (event.type == "badge_upgraded") {
+                        "\u5fbd\u7ae0\u5347\u7ea7\uff1a$title"
+                    } else {
+                        "\u5fbd\u7ae0\u70b9\u4eae\uff1a$title"
+                    }
+                    if (shouldNotify) {
+                        realtimeNotice = FloatingRealtimeNotice(
+                            id = event.id,
+                            title = noticeTitle,
+                            message = if (level > 0) "Lv.$level $stage" else stage,
+                            kind = RealtimeNoticeKind.Achievement
+                        )
+                    }
+                    refreshAchievements()
+                }
             }
         }
     }
@@ -924,6 +1050,9 @@ private fun TouchHomeScreen(
     }
     LaunchedEffect(session.accessToken) {
         refreshFriends()
+    }
+    LaunchedEffect(session.accessToken) {
+        refreshAchievements()
     }
     LaunchedEffect(session.accessToken) {
         realtimeReady = false
@@ -979,7 +1108,11 @@ private fun TouchHomeScreen(
     }
     LaunchedEffect(realtimeNotice?.id) {
         if (realtimeNotice != null) {
-            val durationMs = if (realtimeNotice?.kind == RealtimeNoticeKind.Friend) 8_000L else 4_200L
+            val durationMs = when (realtimeNotice?.kind) {
+                RealtimeNoticeKind.Friend -> 8_000L
+                RealtimeNoticeKind.Achievement -> 6_200L
+                else -> 4_200L
+            }
             delay(durationMs)
             realtimeNotice = null
         }
@@ -996,6 +1129,7 @@ private fun TouchHomeScreen(
             enabled = true,
             onPayload = { payload ->
                 isScanningTap = false
+                NfcTapService.clearPayload()
                 tapStatusIsError = false
                 tapStatusText = "\u5df2\u8bfb\u53d6\uff0c\u6b63\u5728\u7531\u670d\u52a1\u5668\u786e\u8ba4..."
                 Thread {
@@ -1033,7 +1167,15 @@ private fun TouchHomeScreen(
                                 tapStatusIsError = false
                                 tapStatusText = "\u5df2\u786e\u8ba4\uff1a\u548c ${confirmed.personName} \u89c1\u9762"
                                 meetingRecords = listOf(confirmed) + meetingRecords.filter { it.id != confirmed.id }
+                                localNoticeId -= 1
+                                realtimeNotice = FloatingRealtimeNotice(
+                                    id = localNoticeId,
+                                    title = "\u78b0\u4e00\u78b0\u6210\u529f",
+                                    message = "\u548c ${confirmed.personName} \u5df2\u786e\u8ba4\u89c1\u9762",
+                                    kind = RealtimeNoticeKind.Meeting
+                                )
                                 refreshMeetings()
+                                refreshAchievements()
                             } else {
                                 tapStatusIsError = true
                                 tapStatusText = "\u670d\u52a1\u5668\u8fd4\u56de\u4e86\u672a\u77e5\u7684\u78b0\u4e00\u78b0\u72b6\u6001"
@@ -1291,12 +1433,12 @@ private fun TouchHomeScreen(
                             isReady = isReady,
                             isPreparing = isPreparingTap,
                             isScanning = isScanningTap,
-                            onShowMine = {
+                            onStartTap = {
                                 isAccountEditing = false
                                 detail = null
                                 selectedDetailDate = null
                                 pendingFriendPrompt = null
-                                tapDialogMode = TapDialogMode.ShowMine
+                                tapDialogMode = TapDialogMode.Unified
                                 if (!isReady) {
                                     tapStatusIsError = true
                                     tapStatusText = if (!hasNfc) {
@@ -1304,51 +1446,37 @@ private fun TouchHomeScreen(
                                     } else {
                                         "\u8bf7\u5148\u5728\u7cfb\u7edf\u8bbe\u7f6e\u4e2d\u6253\u5f00 NFC"
                                     }
+                                } else if (isPreparingTap || isScanningTap) {
+                                    isPreparingTap = false
+                                    isScanningTap = false
+                                    activity?.setNfcReaderMode(false, {}, {})
+                                    NfcTapService.clearPayload()
+                                    tapStatusIsError = false
+                                    tapStatusText = "\u5df2\u505c\u6b62\u78b0\u4e00\u78b0"
                                 } else {
                                     isPreparingTap = true
                                     tapStatusIsError = false
-                                    tapStatusText = "\u6b63\u5728\u7533\u8bf7\u4e00\u6b21\u6027\u78b0\u4e00\u78b0\u51ed\u8bc1..."
+                                    tapStatusText = "\u6b63\u5728\u51c6\u5907 Touch \u78b0\u4e00\u78b0..."
                                     Thread {
                                         try {
                                             val token = authApiClient.createMeetToken(session.accessToken)
                                             NfcTapService.setPayload(token.nfcPayloadJson)
                                             mainHandler.post {
                                                 isPreparingTap = false
+                                                isScanningTap = true
                                                 tapStatusIsError = false
-                                                tapStatusText = "\u5df2\u51c6\u5907\u597d\uff0c\u8bf7\u8ba9\u5bf9\u65b9\u70b9\u51fb\u201c\u78b0\u4e00\u78b0\u522b\u4eba\u201d\u540e\u9760\u8fd1\u672c\u673a"
+                                                tapStatusText = "\u5df2\u51c6\u5907\u597d\uff0c\u8bf7\u8ba9\u53cc\u65b9\u90fd\u70b9\u51fb\u201c\u5f00\u59cb\u78b0\u4e00\u78b0\u201d\uff0c\u5e76\u5c06\u4e24\u53f0\u624b\u673a NFC \u533a\u57df\u7a33\u5b9a\u9760\u8fd1 1-2 \u79d2"
                                             }
                                         } catch (error: Exception) {
                                             mainHandler.post {
                                                 isPreparingTap = false
+                                                isScanningTap = false
+                                                NfcTapService.clearPayload()
                                                 tapStatusIsError = true
                                                 tapStatusText = error.message ?: "\u751f\u6210\u78b0\u4e00\u78b0\u51ed\u8bc1\u5931\u8d25"
                                             }
                                         }
                                     }.start()
-                                }
-                            },
-                            onScanOther = {
-                                isAccountEditing = false
-                                detail = null
-                                selectedDetailDate = null
-                                pendingFriendPrompt = null
-                                tapDialogMode = TapDialogMode.ScanOther
-                                if (!isReady) {
-                                    tapStatusIsError = true
-                                    tapStatusText = if (!hasNfc) {
-                                        "\u8fd9\u53f0\u8bbe\u5907\u4e0d\u652f\u6301 NFC"
-                                    } else {
-                                        "\u8bf7\u5148\u5728\u7cfb\u7edf\u8bbe\u7f6e\u4e2d\u6253\u5f00 NFC"
-                                    }
-                                } else {
-                                    val nextScanning = !isScanningTap
-                                    isScanningTap = nextScanning
-                                    tapStatusIsError = false
-                                    tapStatusText = if (nextScanning) {
-                                        "\u6b63\u5728\u626b\u63cf\uff0c\u8bf7\u9760\u8fd1\u5df2\u663e\u793a\u78b0\u4e00\u78b0\u7684\u624b\u673a"
-                                    } else {
-                                        "\u5df2\u505c\u6b62\u626b\u63cf"
-                                    }
                                 }
                             }
                         )
@@ -1370,7 +1498,21 @@ private fun TouchHomeScreen(
                         friendships = it
                         refreshFriends()
                         refreshMeetings()
+                        refreshAchievements()
                     }
+                )
+
+                MainTab.Achievements -> AchievementScreen(
+                    modifier = Modifier.padding(innerPadding),
+                    state = achievementState,
+                    acceptedFriends = acceptedFriends,
+                    errorText = achievementLoadError,
+                    authApiClient = authApiClient
+                )
+
+                MainTab.Transfer -> NoteTransferScreen(
+                    modifier = Modifier.padding(innerPadding),
+                    mainHandler = mainHandler
                 )
 
                 MainTab.Mine -> LazyColumn(
@@ -1384,11 +1526,9 @@ private fun TouchHomeScreen(
                     verticalArrangement = Arrangement.spacedBy(18.dp)
                 ) {
                     item(key = "mine-header") {
-                        Text(
-                            text = "\u6211\u7684",
-                            style = MaterialTheme.typography.headlineSmall,
-                            color = TouchColors.TextStrong,
-                            fontWeight = FontWeight.Bold
+                        PageHeader(
+                            title = "\u6211\u7684",
+                            subtitle = "\u540d\u7247\u3001\u4e3b\u9898\u4e0e\u8d26\u6237\u8bbe\u7f6e"
                         )
                     }
                     item(key = "mine-theme") {
@@ -1440,13 +1580,10 @@ private fun TouchHomeScreen(
                     }.start()
                 },
                 onDismiss = {
-                    if (mode == TapDialogMode.ShowMine) {
-                        NfcTapService.clearPayload()
-                    }
-                    if (mode == TapDialogMode.ScanOther) {
-                        isScanningTap = false
-                        activity?.setNfcReaderMode(false, {}, {})
-                    }
+                    isPreparingTap = false
+                    isScanningTap = false
+                    activity?.setNfcReaderMode(false, {}, {})
+                    NfcTapService.clearPayload()
                     pendingFriendPrompt = null
                     tapDialogMode = null
                 }
@@ -1484,6 +1621,207 @@ private fun TouchHomeScreen(
 }
 
 @Composable
+private fun NoteTransferScreen(
+    modifier: Modifier = Modifier,
+    mainHandler: Handler
+) {
+    val context = LocalContext.current
+    var title by remember { mutableStateOf("\u8bfe\u5802\u7b14\u8bb0") }
+    var selectedUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var statusText by remember { mutableStateOf<String?>(null) }
+    var isPacking by remember { mutableStateOf(false) }
+    var packedCount by remember { mutableIntStateOf(0) }
+    var zipFile by remember { mutableStateOf<File?>(null) }
+    var pendingSaveFile by remember { mutableStateOf<File?>(null) }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris: List<Uri> ->
+        if (uris.isNotEmpty()) {
+            val updatedUris = selectedUris + uris
+            selectedUris = updatedUris
+            zipFile = null
+            packedCount = 0
+            statusText = "\u5df2\u52a0\u5165 ${updatedUris.size} \u5f20\uff0c\u53ef\u7ee7\u7eed\u8ffd\u52a0\u6216\u751f\u6210 zip"
+        }
+    }
+    val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { targetUri: Uri? ->
+        val source = pendingSaveFile
+        pendingSaveFile = null
+        if (targetUri == null || source == null) return@rememberLauncherForActivityResult
+        Thread {
+            try {
+                context.contentResolver.openOutputStream(targetUri)?.use { output ->
+                    source.inputStream().use { input -> input.copyTo(output) }
+                } ?: throw IOException("\u65e0\u6cd5\u5199\u5165\u9009\u62e9\u7684\u4f4d\u7f6e")
+                mainHandler.post { statusText = "\u5df2\u4fdd\u5b58\u5230\u4f60\u9009\u62e9\u7684\u4f4d\u7f6e" }
+            } catch (error: Exception) {
+                mainHandler.post { statusText = error.message ?: "\u4fdd\u5b58\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5" }
+            }
+        }.start()
+    }
+
+    fun startPacking() {
+        if (selectedUris.isEmpty() || isPacking) return
+        isPacking = true
+        packedCount = 0
+        zipFile = null
+        statusText = "\u6b63\u5728\u6574\u7406\u5e76\u751f\u6210 zip..."
+        val packingUris = selectedUris.toList()
+        val packingTitle = title.ifBlank { "\u8bfe\u5802\u7b14\u8bb0" }
+        Thread {
+            try {
+                val packed = buildLocalNoteZip(
+                    context = context,
+                    title = packingTitle,
+                    uris = packingUris
+                ) { count ->
+                    mainHandler.post {
+                        packedCount = count
+                        statusText = "\u5df2\u6574\u7406 $count/${packingUris.size} \u5f20"
+                    }
+                }
+                mainHandler.post {
+                    isPacking = false
+                    zipFile = packed
+                    packedCount = packingUris.size
+                    statusText = "zip \u5df2\u751f\u6210\uff1a${packed.name} \u00b7 ${formatFileSize(packed.length())}"
+                }
+            } catch (error: Exception) {
+                mainHandler.post {
+                    isPacking = false
+                    statusText = error.message ?: "\u751f\u6210 zip \u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5"
+                }
+            }
+        }.start()
+    }
+
+    fun shareZip(file: File) {
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        val sendIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "application/zip"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(sendIntent, "\u5206\u4eab\u8bfe\u5802\u7b14\u8bb0 zip"))
+    }
+
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 20.dp, vertical = 18.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        item(key = "note-transfer-header") {
+            PageHeader(
+                title = "\u4f20\u56fe",
+                subtitle = "\u4ece\u76f8\u518c\u6309\u987a\u5e8f\u9009\u62e9\u8bfe\u5802\u7167\u7247\uff0c\u5728\u624b\u673a\u672c\u5730\u91cd\u547d\u540d\u5e76\u6253\u5305\u6210 zip"
+            )
+        }
+        item(key = "note-transfer-main") {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = TouchColors.Surface,
+                shape = RoundedCornerShape(8.dp),
+                shadowElevation = 4.dp
+            ) {
+                Column(
+                    modifier = Modifier.padding(15.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        text = "\u65b0\u5efa\u8bfe\u5802\u7167\u7247\u5305",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = TouchColors.TextStrong,
+                        fontWeight = FontWeight.Bold
+                    )
+                    OutlinedTextField(
+                        value = title,
+                        onValueChange = {
+                            title = it.take(80)
+                            zipFile = null
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("\u6587\u4ef6\u540d") },
+                        singleLine = true
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        OutlinedButton(
+                            onClick = { picker.launch("image/*") },
+                            enabled = !isPacking,
+                            colors = touchOutlinedButtonColors(),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("\u4ece\u76f8\u518c\u8ffd\u52a0")
+                        }
+                        Button(
+                            onClick = { startPacking() },
+                            enabled = selectedUris.isNotEmpty() && !isPacking,
+                            colors = touchPrimaryButtonColors(),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(if (isPacking) "\u751f\u6210\u4e2d" else "\u751f\u6210 zip")
+                        }
+                    }
+                    if (selectedUris.isNotEmpty()) {
+                        AchievementProgressBar(
+                            progressRatio = packedCount.toFloat() / selectedUris.size,
+                            color = TouchColors.Primary,
+                            unlocked = packedCount == selectedUris.size && selectedUris.isNotEmpty()
+                        )
+                        Text(
+                            text = "\u5df2\u9009\u62e9 ${selectedUris.size} \u5f20\uff0c\u5c06\u6309\u5f53\u524d\u9009\u62e9\u987a\u5e8f\u547d\u540d\u4e3a 0001\u30010002...",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TouchColors.TextMuted
+                        )
+                    }
+                    zipFile?.let { file ->
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Button(
+                                onClick = { shareZip(file) },
+                                colors = touchPrimaryButtonColors(),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("\u5206\u4eab\u7ed9\u597d\u53cb")
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    pendingSaveFile = file
+                                    saveLauncher.launch(file.name)
+                                },
+                                colors = touchOutlinedButtonColors(),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("\u4fdd\u5b58\u5230\u672c\u5730")
+                            }
+                        }
+                    }
+                    statusText?.let {
+                        Text(
+                            text = it,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (it.contains("\u5931\u8d25")) TouchColors.Error else TouchColors.TextMuted
+                        )
+                    }
+                }
+            }
+        }
+        item(key = "note-transfer-note") {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = TouchColors.DetailSurface,
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("\u672c\u5730\u5904\u7406", style = MaterialTheme.typography.titleMedium, color = TouchColors.TextStrong, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = "\u7167\u7247\u4e0d\u4f1a\u4e0a\u4f20\u5230 Touch \u670d\u52a1\u5668\u3002zip \u751f\u6210\u540e\u53ef\u4ee5\u7528\u7cfb\u7edf\u5206\u4eab\u53d1\u9001\u5230\u5fae\u4fe1\uff0c\u4e5f\u53ef\u4ee5\u901a\u8fc7\u6587\u4ef6\u9009\u62e9\u5668\u4fdd\u5b58\u5230\u624b\u673a\u5b58\u50a8\u3002",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TouchColors.TextMuted
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun ThemeStylePanel(
     selectedStyle: ThemeStyle,
     onStyleSelected: (ThemeStyle) -> Unit
@@ -1492,7 +1830,7 @@ private fun ThemeStylePanel(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = TouchColors.Surface),
         shape = RoundedCornerShape(8.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 3.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Column(
             modifier = Modifier.padding(14.dp),
@@ -1628,7 +1966,7 @@ private fun AccountPanel(
             .fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = TouchColors.Surface),
         shape = RoundedCornerShape(8.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 3.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Column(
             modifier = Modifier
@@ -1715,6 +2053,13 @@ private fun AccountPanel(
                         previewUsesDefaultBackground = usesDefault
                     },
                     onSessionChanged = onSessionChanged,
+                    onDiscard = {
+                        previewBackgroundBitmap = null
+                        previewBackgroundUri = null
+                        previewBackgroundKey = session.cardBackgroundKey ?: "mizuki"
+                        previewUsesDefaultBackground = session.cardBackgroundUrl == null
+                        onEditingChange(false)
+                    },
                     onDismiss = { onEditingChange(false) }
                 )
             }
@@ -1732,6 +2077,7 @@ private fun AccountEditInline(
     pendingBackgroundUri: Uri?,
     onBackgroundPreviewChanged: (String, Uri?, Bitmap?, Boolean) -> Unit,
     onSessionChanged: (UserSession) -> Unit,
+    onDiscard: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
@@ -1876,6 +2222,19 @@ private fun AccountEditInline(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
+            OutlinedButton(
+                onClick = onDiscard,
+                enabled = !isSaving,
+                modifier = Modifier.weight(0.42f),
+                shape = RoundedCornerShape(8.dp),
+                colors = touchOutlinedButtonColors()
+            ) {
+                Text(
+                    text = "\u653e\u5f03\u4fee\u6539",
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
             Button(
                 onClick = {
                     val nextName = draftName.trim()
@@ -1917,7 +2276,7 @@ private fun AccountEditInline(
                 enabled = !isSaving,
                 interactionSource = saveButtonInteraction,
                 modifier = Modifier
-                    .fillMaxWidth()
+                    .weight(0.58f)
                     .graphicsLayer {
                         scaleX = saveButtonScale
                         scaleY = saveButtonScale
@@ -2146,6 +2505,188 @@ private fun encodeImageBase64(context: Context, uri: Uri): String? {
     }
 }
 
+private fun buildLocalNoteZip(
+    context: Context,
+    title: String,
+    uris: List<Uri>,
+    onProgress: (Int) -> Unit
+): File {
+    if (uris.isEmpty()) {
+        throw IOException("\u8bf7\u5148\u9009\u62e9\u8981\u6253\u5305\u7684\u56fe\u7247")
+    }
+    val outputDir = File(context.cacheDir, "touch_note_transfer").apply {
+        mkdirs()
+        listFiles()?.forEach { file ->
+            if (file.isFile && file.lastModified() < System.currentTimeMillis() - 24 * 60 * 60 * 1000L) {
+                file.delete()
+            }
+        }
+    }
+    val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+    val output = File(outputDir, "${safeLocalZipTitle(title)}_$timestamp.zip")
+    ZipOutputStream(output.outputStream().buffered()).use { zip ->
+        zip.setLevel(Deflater.NO_COMPRESSION)
+        uris.forEachIndexed { index, uri ->
+            val prepared = prepareNoteZipImage(context, uri)
+            val entryName = "${(index + 1).toString().padStart(4, '0')}.${prepared.extension}"
+            val entry = ZipEntry(entryName).apply {
+                time = System.currentTimeMillis()
+            }
+            zip.putNextEntry(entry)
+            try {
+                prepared.writeTo(zip)
+            } finally {
+                zip.closeEntry()
+                prepared.close()
+            }
+            onProgress(index + 1)
+        }
+    }
+    return output
+}
+
+private class PreparedZipImage(
+    val extension: String,
+    private val closeAction: () -> Unit = {},
+    private val writer: (ZipOutputStream) -> Unit
+) {
+    fun writeTo(zip: ZipOutputStream) {
+        writer(zip)
+    }
+
+    fun close() {
+        closeAction()
+    }
+}
+
+private fun prepareNoteZipImage(context: Context, uri: Uri): PreparedZipImage {
+    val originalSize = contentLengthForUri(context, uri)
+    if (originalSize != null && originalSize <= NOTE_PHOTO_MAX_BYTES) {
+        return PreparedZipImage(extension = extensionForUri(context, uri)) { zip ->
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                input.copyTo(zip)
+            } ?: throw IOException("\u65e0\u6cd5\u8bfb\u53d6\u9009\u62e9\u7684\u56fe\u7247")
+        }
+    }
+    val compressed = compressNoteImageUnderLimit(context, uri)
+    return PreparedZipImage(
+        extension = "jpg",
+        closeAction = { compressed.delete() }
+    ) { zip ->
+        compressed.inputStream().use { input -> input.copyTo(zip) }
+    }
+}
+
+private fun contentLengthForUri(context: Context, uri: Uri): Long? {
+    return runCatching {
+        context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { descriptor ->
+            descriptor.length.takeIf { it >= 0L }
+        }
+    }.getOrNull()
+}
+
+private fun compressNoteImageUnderLimit(context: Context, uri: Uri): File {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    context.contentResolver.openInputStream(uri)?.use { input ->
+        BitmapFactory.decodeStream(input, null, bounds)
+    }
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+        throw IOException("\u65e0\u6cd5\u89e3\u6790\u9700\u8981\u538b\u7f29\u7684\u56fe\u7247")
+    }
+    val sampleSize = calculateNoteImageSampleSize(bounds.outWidth, bounds.outHeight)
+    val options = BitmapFactory.Options().apply {
+        inSampleSize = sampleSize
+        inPreferredConfig = Bitmap.Config.ARGB_8888
+    }
+    val decoded = context.contentResolver.openInputStream(uri)?.use { input ->
+        BitmapFactory.decodeStream(input, null, options)
+    } ?: throw IOException("\u65e0\u6cd5\u89e3\u6790\u9700\u8981\u538b\u7f29\u7684\u56fe\u7247")
+
+    var working = decoded
+    var scale = 1f
+    val qualities = listOf(95, 92, 90, 88, 85, 82, 78)
+    var bestBytes: ByteArray? = null
+    repeat(8) {
+        for (quality in qualities) {
+            val bytes = ByteArrayOutputStream().use { output ->
+                working.compress(Bitmap.CompressFormat.JPEG, quality, output)
+                output.toByteArray()
+            }
+            bestBytes = bytes
+            if (bytes.size <= NOTE_PHOTO_MAX_BYTES) {
+                if (working !== decoded) {
+                    working.recycle()
+                }
+                decoded.recycle()
+                return writeCompressedNoteTempFile(context, bytes)
+            }
+        }
+        scale *= 0.9f
+        val nextWidth = (decoded.width * scale).toInt().coerceAtLeast(1)
+        val nextHeight = (decoded.height * scale).toInt().coerceAtLeast(1)
+        if (nextWidth == working.width && nextHeight == working.height) {
+            return@repeat
+        }
+        val next = Bitmap.createScaledBitmap(decoded, nextWidth, nextHeight, true)
+        if (working !== decoded) {
+            working.recycle()
+        }
+        working = next
+    }
+    val fallback = bestBytes ?: throw IOException("\u56fe\u7247\u538b\u7f29\u5931\u8d25")
+    if (working !== decoded) {
+        working.recycle()
+    }
+    decoded.recycle()
+    if (fallback.size > NOTE_PHOTO_MAX_BYTES) {
+        throw IOException("\u56fe\u7247\u8fc7\u5927\uff0c\u65e0\u6cd5\u5728\u4fdd\u6301\u57fa\u672c\u753b\u8d28\u7684\u540c\u65f6\u538b\u5230 5MB \u4ee5\u4e0b")
+    }
+    return writeCompressedNoteTempFile(context, fallback)
+}
+
+private fun writeCompressedNoteTempFile(context: Context, bytes: ByteArray): File {
+    val outputDir = File(context.cacheDir, "touch_note_transfer_compressed").apply { mkdirs() }
+    return File(outputDir, "note_${UUID.randomUUID().toString().replace("-", "")}.jpg").apply {
+        writeBytes(bytes)
+    }
+}
+
+private fun calculateNoteImageSampleSize(width: Int, height: Int): Int {
+    var sample = 1
+    val maxPixels = 18_000_000
+    while ((width / sample).toLong() * (height / sample).toLong() > maxPixels) {
+        sample *= 2
+    }
+    return sample
+}
+
+private fun safeLocalZipTitle(title: String): String {
+    val cleaned = title.trim()
+        .replace(Regex("[\\\\/:*?\"<>|\\s]+"), "_")
+        .trim('_')
+        .take(40)
+    return cleaned.ifBlank { "TouchNotes" }
+}
+
+private fun extensionForUri(context: Context, uri: Uri): String {
+    val mimeType = context.contentResolver.getType(uri).orEmpty().lowercase(Locale.US)
+    return when (mimeType) {
+        "image/jpeg", "image/jpg" -> "jpg"
+        "image/png" -> "png"
+        "image/heic" -> "heic"
+        "image/heif" -> "heif"
+        "image/webp" -> "webp"
+        "image/gif" -> "gif"
+        else -> "jpg"
+    }
+}
+
+private fun formatFileSize(bytes: Long): String {
+    val kb = bytes / 1024.0
+    if (kb < 1024.0) return String.format(Locale.US, "%.1f KB", kb)
+    return String.format(Locale.US, "%.1f MB", kb / 1024.0)
+}
+
 private fun decodeBase64Bitmap(raw: String): Bitmap? {
     return runCatching {
         val bytes = Base64.decode(raw, Base64.DEFAULT)
@@ -2239,28 +2780,80 @@ private fun touchTextButtonColors() = ButtonDefaults.textButtonColors(
 
 @Composable
 private fun Header(isReady: Boolean) {
-    Row(
+    Surface(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
+        color = TouchColors.Surface,
+        shape = RoundedCornerShape(8.dp),
+        shadowElevation = 3.dp
     ) {
-        Column(
-            modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(96.dp)
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Text(
-                    text = "Touch",
-                    style = MaterialTheme.typography.headlineLarge,
-                    color = TouchColors.Primary,
-                    fontWeight = FontWeight.Bold
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawCircle(
+                    color = TouchColors.Accent.copy(alpha = 0.16f),
+                    radius = size.minDimension * 0.58f,
+                    center = Offset(size.width * 0.92f, size.height * 0.02f)
                 )
+                drawCircle(
+                    color = TouchColors.Primary.copy(alpha = 0.10f),
+                    radius = size.minDimension * 0.38f,
+                    center = Offset(size.width * 0.12f, size.height * 1.02f)
+                )
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    Text(
+                        text = "Touch",
+                        style = MaterialTheme.typography.headlineLarge,
+                        color = TouchColors.Primary,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "\u8f7b\u8f7b\u78b0\u4e00\u78b0\uff0c\u8bb0\u4e0b\u771f\u5b9e\u89c1\u9762",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TouchColors.TextMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
                 ReadinessPill(isReady = isReady)
             }
         }
+    }
+}
+
+@Composable
+private fun PageHeader(
+    title: String,
+    subtitle: String,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.headlineSmall,
+            color = TouchColors.TextStrong,
+            fontWeight = FontWeight.Bold
+        )
+        Text(
+            text = subtitle,
+            style = MaterialTheme.typography.bodyMedium,
+            color = TouchColors.TextMuted,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
 
@@ -2331,6 +2924,20 @@ private fun BottomTabBar(
                     label = "\u597d\u53cb",
                     selected = selectedTab == MainTab.Friends,
                     onClick = { onTabSelected(MainTab.Friends) },
+                    modifier = Modifier.weight(1f)
+                )
+                BottomTabItem(
+                    tab = MainTab.Achievements,
+                    label = "\u6210\u5c31",
+                    selected = selectedTab == MainTab.Achievements,
+                    onClick = { onTabSelected(MainTab.Achievements) },
+                    modifier = Modifier.weight(1f)
+                )
+                BottomTabItem(
+                    tab = MainTab.Transfer,
+                    label = "\u4f20\u56fe",
+                    selected = selectedTab == MainTab.Transfer,
+                    onClick = { onTabSelected(MainTab.Transfer) },
                     modifier = Modifier.weight(1f)
                 )
                 BottomTabItem(
@@ -2465,6 +3072,64 @@ private fun BottomTabGlyph(
                     cornerRadius = androidx.compose.ui.geometry.CornerRadius(18.dp.toPx(), 18.dp.toPx())
                 )
             }
+            MainTab.Achievements -> {
+                drawCircle(
+                    color = softTint,
+                    radius = size.minDimension * 0.34f,
+                    center = center,
+                    style = Stroke(width = 2.dp.toPx())
+                )
+                val top = Offset(size.width * 0.5f, size.height * 0.2f)
+                val right = Offset(size.width * 0.72f, size.height * 0.48f)
+                val bottomRight = Offset(size.width * 0.61f, size.height * 0.78f)
+                val bottomLeft = Offset(size.width * 0.39f, size.height * 0.78f)
+                val left = Offset(size.width * 0.28f, size.height * 0.48f)
+                drawLine(tint, top, right, strokeWidth = 2.1.dp.toPx())
+                drawLine(tint, right, bottomRight, strokeWidth = 2.1.dp.toPx())
+                drawLine(tint, bottomRight, bottomLeft, strokeWidth = 2.1.dp.toPx())
+                drawLine(tint, bottomLeft, left, strokeWidth = 2.1.dp.toPx())
+                drawLine(tint, left, top, strokeWidth = 2.1.dp.toPx())
+                drawCircle(color = tint, radius = size.minDimension * 0.08f, center = center)
+            }
+            MainTab.Transfer -> {
+                drawRoundRect(
+                    color = softTint,
+                    topLeft = Offset(size.width * 0.18f, size.height * 0.24f),
+                    size = androidx.compose.ui.geometry.Size(size.width * 0.64f, size.height * 0.44f),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(4.dp.toPx(), 4.dp.toPx()),
+                    style = Stroke(width = 1.9.dp.toPx())
+                )
+                drawLine(
+                    color = tint,
+                    start = Offset(size.width * 0.28f, size.height * 0.57f),
+                    end = Offset(size.width * 0.42f, size.height * 0.44f),
+                    strokeWidth = 2.dp.toPx()
+                )
+                drawLine(
+                    color = tint,
+                    start = Offset(size.width * 0.42f, size.height * 0.44f),
+                    end = Offset(size.width * 0.55f, size.height * 0.56f),
+                    strokeWidth = 2.dp.toPx()
+                )
+                drawLine(
+                    color = tint,
+                    start = Offset(size.width * 0.5f, size.height * 0.82f),
+                    end = Offset(size.width * 0.5f, size.height * 0.56f),
+                    strokeWidth = 2.1.dp.toPx()
+                )
+                drawLine(
+                    color = tint,
+                    start = Offset(size.width * 0.38f, size.height * 0.68f),
+                    end = Offset(size.width * 0.5f, size.height * 0.82f),
+                    strokeWidth = 2.1.dp.toPx()
+                )
+                drawLine(
+                    color = tint,
+                    start = Offset(size.width * 0.62f, size.height * 0.68f),
+                    end = Offset(size.width * 0.5f, size.height * 0.82f),
+                    strokeWidth = 2.1.dp.toPx()
+                )
+            }
             MainTab.Mine -> {
                 drawCircle(
                     color = tint,
@@ -2558,7 +3223,10 @@ private fun FriendManagementScreen(
     val incoming = friendships.filter { it.status == "pending" && it.direction == "incoming" && it.friend != null }
     val outgoing = friendships.filter { it.status == "pending" && it.direction == "outgoing" && it.friend != null }
 
-    fun runFriendAction(action: () -> Unit) {
+    fun runFriendAction(
+        updatedFriendships: List<Friendship>? = null,
+        action: () -> Unit
+    ) {
         isBusy = true
         Thread {
             try {
@@ -2566,7 +3234,7 @@ private fun FriendManagementScreen(
                 mainHandler.post {
                     isBusy = false
                     statusText = null
-                    onFriendshipsChanged(friendships)
+                    onFriendshipsChanged(updatedFriendships ?: friendships)
                 }
             } catch (error: Exception) {
                 mainHandler.post {
@@ -2589,21 +3257,13 @@ private fun FriendManagementScreen(
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.Top
             ) {
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(
-                        text = "\u597d\u53cb\u7ba1\u7406",
-                        style = MaterialTheme.typography.headlineSmall,
-                        color = TouchColors.TextStrong,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = "\u53ea\u6709\u597d\u53cb\u4e4b\u95f4\u7684\u78b0\u4e00\u78b0\u4f1a\u88ab\u8bb0\u5f55",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = TouchColors.TextMuted
-                    )
-                }
+                PageHeader(
+                    title = "\u597d\u53cb",
+                    subtitle = "\u7ba1\u7406\u7533\u8bf7\u3001\u5907\u6ce8\u548c\u78b0\u4e00\u78b0\u6743\u9650",
+                    modifier = Modifier.weight(1f)
+                )
                 if (showBackButton) {
                     TextButton(onClick = onBack, colors = touchTextButtonColors()) {
                         Text("\u8fd4\u56de", color = TouchColors.Primary, fontWeight = FontWeight.SemiBold)
@@ -2616,11 +3276,11 @@ private fun FriendManagementScreen(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = TouchColors.Surface),
                 shape = RoundedCornerShape(8.dp),
-                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
             ) {
                 Column(
-                    modifier = Modifier.padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                    modifier = Modifier.padding(15.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(
                         text = "\u641c\u7d22\u65b0\u597d\u53cb",
@@ -2629,7 +3289,9 @@ private fun FriendManagementScreen(
                         fontWeight = FontWeight.Bold
                     )
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(56.dp),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -2641,12 +3303,15 @@ private fun FriendManagementScreen(
                             },
                             modifier = Modifier
                                 .weight(1f)
-                                .height(56.dp),
-                            label = { Text("\u7528\u6237\u540d") },
+                                .fillMaxHeight(),
+                            placeholder = { Text("\u7528\u6237\u540d") },
                             singleLine = true
                         )
-                        Button(
-                            onClick = {
+                        Surface(
+                            modifier = Modifier
+                                .width(76.dp)
+                                .fillMaxHeight()
+                                .cuteClickable(enabled = !isBusy) {
                                 if (searchText.trim().isBlank()) {
                                     statusText = "\u8bf7\u8f93\u5165\u8981\u641c\u7d22\u7684\u7528\u6237\u540d"
                                 } else {
@@ -2669,18 +3334,27 @@ private fun FriendManagementScreen(
                                     }.start()
                                 }
                             },
-                            enabled = !isBusy,
-                            modifier = Modifier.height(56.dp),
                             shape = RoundedCornerShape(8.dp),
-                            colors = primaryButtonColors
+                            color = if (isBusy) TouchColors.CalendarTile else TouchColors.Primary
                         ) {
-                            Text("\u641c\u7d22")
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = "\u641c\u7d22",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = if (isBusy) TouchColors.TextMuted else Color.White,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
                         }
                     }
                     searchResults.forEach { user ->
                         FriendUserRow(
                             user = user,
                             authApiClient = authApiClient,
+                            subtitle = "\u70b9\u51fb\u7533\u8bf7\u6dfb\u52a0\u597d\u53cb",
                             trailing = {
                                 OutlinedButton(
                                     onClick = {
@@ -2783,30 +3457,12 @@ private fun FriendManagementScreen(
                             onAvatarClick = { onFriendCardOpen(friendship) },
                             subtitle = friendMeetRatioLabel(meetingRecords, user.userId),
                             trailing = {
-                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    OutlinedButton(
-                                        onClick = {
-                                            runFriendAction {
-                                                authApiClient.blockFriend(
-                                                    session.accessToken,
-                                                    user.userId,
-                                                    !friendship.blockedByMe
-                                                )
-                                            }
-                                        },
-                                        enabled = !isBusy,
-                                        shape = RoundedCornerShape(8.dp),
-                                        colors = outlineButtonColors
-                                    ) {
-                                        Text(if (friendship.blockedByMe) "\u53d6\u6d88\u5c4f\u853d" else "\u5c4f\u853d")
-                                    }
-                                    TextButton(
-                                        onClick = { friendPendingRemove = friendship },
-                                        enabled = !isBusy,
-                                        colors = dangerTextButtonColors
-                                    ) {
-                                        Text("\u5220\u9664")
-                                    }
+                                TextButton(
+                                    onClick = { friendPendingRemove = friendship },
+                                    enabled = !isBusy,
+                                    colors = dangerTextButtonColors
+                                ) {
+                                    Text("\u5220\u9664")
                                 }
                             }
                         )
@@ -2837,16 +3493,836 @@ private fun FriendManagementScreen(
         if (user != null) {
             ConfirmRemoveFriendDialog(
                 friendName = user.displayName,
+                isBlocked = friendship.blockedByMe,
                 isBusy = isBusy,
                 onCancel = { if (!isBusy) friendPendingRemove = null },
-                onConfirm = {
+                onBlock = {
                     friendPendingRemove = null
                     runFriendAction {
+                        authApiClient.blockFriend(
+                            session.accessToken,
+                            user.userId,
+                            !friendship.blockedByMe
+                        )
+                    }
+                },
+                onConfirm = {
+                    friendPendingRemove = null
+                    runFriendAction(
+                        updatedFriendships = friendships.filter { it.id != friendship.id }
+                    ) {
                         authApiClient.removeFriend(session.accessToken, user.userId)
                     }
                 }
             )
         }
+    }
+}
+
+@Composable
+private fun AchievementScreen(
+    modifier: Modifier = Modifier,
+    state: AchievementState,
+    acceptedFriends: List<FriendUser>,
+    errorText: String?,
+    authApiClient: AuthApiClient
+) {
+    var selectedAchievement by remember { mutableStateOf<Achievement?>(null) }
+    var expandedFriendId by remember { mutableStateOf<String?>(null) }
+    val acceptedFriendIds = remember(acceptedFriends) { acceptedFriends.map { it.userId }.toSet() }
+    val visibleFriendAchievements = remember(state.friendAchievements, acceptedFriendIds) {
+        state.friendAchievements.filter { achievement ->
+            achievement.friend?.userId?.let { it in acceptedFriendIds } == true
+        }
+    }
+    val allAchievements = remember(state, visibleFriendAchievements) { state.personal + visibleFriendAchievements }
+    val unlocked = remember(allAchievements) { allAchievements.filter { it.unlocked } }
+    val incompletePersonal = remember(state.personal) {
+        state.personal.filter { it.level < it.maxLevel }.sortedWith(achievementProgressComparator())
+    }
+    val completedPersonalAchievements = remember(state.personal) {
+        state.personal.filter { it.level >= it.maxLevel }.sortedByDescending { it.upgradedAt ?: it.unlockedAt ?: 0L }
+    }
+    val friendGroups = remember(visibleFriendAchievements) {
+        visibleFriendAchievements
+            .filter { it.friend != null }
+            .groupBy { it.friend!!.userId }
+            .mapNotNull { (_, achievements) ->
+                val friend = achievements.firstOrNull()?.friend ?: return@mapNotNull null
+                FriendAchievementGroup(
+                    friend = friend,
+                    achievements = achievements.sortedWith(
+                        compareBy<Achievement> { it.level >= it.maxLevel }
+                            .thenByDescending { it.progress.toFloat() / it.target.coerceAtLeast(1) }
+                            .thenBy { it.title }
+                    )
+                )
+            }
+            .sortedWith(
+                compareByDescending<FriendAchievementGroup> { group -> group.achievements.count { it.unlocked } }
+                    .thenBy { it.friend.displayName }
+            )
+    }
+    val nearUnlock = remember(allAchievements) {
+        allAchievements
+            .filter { it.level < it.maxLevel && it.progress > 0 }
+            .sortedWith(achievementProgressComparator())
+            .take(3)
+    }
+    selectedAchievement?.let { achievement ->
+        AchievementDetailDialog(
+            achievement = achievement,
+            authApiClient = authApiClient,
+            onDismiss = { selectedAchievement = null }
+        )
+    }
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(
+            horizontal = 20.dp,
+            vertical = 18.dp
+        ),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        item(key = "achievement-header") {
+            PageHeader(
+                title = "\u6210\u5c31",
+                subtitle = "\u70b9\u4eae\u548c\u5347\u7ea7\u4f60\u4e0e\u597d\u53cb\u4e4b\u95f4\u7684\u5fbd\u7ae0"
+            )
+        }
+        item(key = "achievement-hero") {
+            AchievementHeroCard(summary = state.summary, recent = unlocked.maxByOrNull { it.unlockedAt ?: 0L })
+        }
+        if (errorText != null) {
+            item(key = "achievement-error") {
+                Text(
+                    text = errorText,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TouchColors.Error
+                )
+            }
+        }
+        if (nearUnlock.isNotEmpty()) {
+            item(key = "near-title") {
+                Text(
+                    text = "\u5373\u5c06\u5347\u7ea7",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = TouchColors.TextStrong,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            item(key = "near-row") {
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    nearUnlock.forEach { achievement ->
+                        AchievementCard(
+                            achievement = achievement,
+                            authApiClient = authApiClient,
+                            onClick = { selectedAchievement = achievement },
+                            modifier = Modifier.width(220.dp)
+                        )
+                    }
+                }
+            }
+        }
+        if (incompletePersonal.isNotEmpty()) {
+            item(key = "personal-title") {
+                AchievementSectionHeader(
+                    title = "\u4e2a\u4eba\u5fbd\u7ae0",
+                    count = "${state.summary.personalUnlocked}/${state.personal.size}"
+                )
+            }
+            itemsWithKeys(
+                items = incompletePersonal,
+                keyPrefix = "personal-achievement"
+            ) { achievement ->
+                AchievementCard(
+                    achievement = achievement,
+                    authApiClient = authApiClient,
+                    onClick = { selectedAchievement = achievement },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        }
+        item(key = "friend-title") {
+            AchievementSectionHeader(
+                title = "\u597d\u53cb\u7f81\u7eca",
+                count = "${visibleFriendAchievements.count { it.unlocked }}/${visibleFriendAchievements.size}"
+            )
+        }
+        friendGroups.forEach { group ->
+            item(key = "friend-achievement-group-${group.friend.userId}") {
+                FriendAchievementGroupCard(
+                    group = group,
+                    expanded = expandedFriendId == group.friend.userId,
+                    authApiClient = authApiClient,
+                    onClick = {
+                        expandedFriendId = if (expandedFriendId == group.friend.userId) null else group.friend.userId
+                    }
+                )
+            }
+            if (expandedFriendId == group.friend.userId) {
+                val incompleteFriendAchievements = group.achievements
+                    .filter { it.level < it.maxLevel }
+                    .sortedWith(achievementProgressComparator())
+                val completedFriendAchievements = group.achievements
+                    .filter { it.level >= it.maxLevel }
+                    .sortedByDescending { it.upgradedAt ?: it.unlockedAt ?: 0L }
+                if (incompleteFriendAchievements.isEmpty() && completedFriendAchievements.isEmpty()) {
+                    item(key = "friend-achievement-empty-${group.friend.userId}") {
+                        Text(
+                            text = "\u8fd9\u4f4d\u597d\u53cb\u6682\u65f6\u6ca1\u6709\u7f81\u7eca\u5fbd\u7ae0\u3002",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TouchColors.TextMuted,
+                            modifier = Modifier.padding(horizontal = 4.dp)
+                        )
+                    }
+                }
+                itemsWithKeys(
+                    items = incompleteFriendAchievements,
+                    keyPrefix = "friend-achievement-${group.friend.userId}"
+                ) { achievement ->
+                    AchievementCard(
+                        achievement = achievement,
+                        authApiClient = authApiClient,
+                        onClick = { selectedAchievement = achievement },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 14.dp)
+                    )
+                }
+                if (completedFriendAchievements.isNotEmpty()) {
+                    item(key = "friend-achievement-completed-title-${group.friend.userId}") {
+                        Text(
+                            text = "\u5df2\u6ee1\u7ea7",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = TouchColors.TextMuted,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(start = 18.dp, top = 2.dp)
+                        )
+                    }
+                    itemsWithKeys(
+                        items = completedFriendAchievements,
+                        keyPrefix = "friend-achievement-completed-${group.friend.userId}"
+                    ) { achievement ->
+                        AchievementCard(
+                            achievement = achievement,
+                            authApiClient = authApiClient,
+                            onClick = { selectedAchievement = achievement },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = 14.dp)
+                        )
+                    }
+                }
+            }
+        }
+        if (completedPersonalAchievements.isNotEmpty()) {
+            item(key = "completed-title") {
+                AchievementSectionHeader(
+                    title = "\u4e2a\u4eba\u6ee1\u7ea7",
+                    count = "${completedPersonalAchievements.size}/${state.personal.size}"
+                )
+            }
+            itemsWithKeys(
+                items = completedPersonalAchievements,
+                keyPrefix = "completed-personal-achievement"
+            ) { achievement ->
+                AchievementCard(
+                    achievement = achievement,
+                    authApiClient = authApiClient,
+                    onClick = { selectedAchievement = achievement },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        }
+    }
+}
+
+private fun achievementProgressComparator(): Comparator<Achievement> {
+    return compareByDescending<Achievement> { it.progress.toFloat() / it.target.coerceAtLeast(1) }
+        .thenBy { it.title }
+}
+
+@Composable
+private fun FriendAchievementGroupCard(
+    group: FriendAchievementGroup,
+    expanded: Boolean,
+    authApiClient: AuthApiClient,
+    onClick: () -> Unit
+) {
+    val completed = group.achievements.count { it.unlocked }
+    val total = group.achievements.size
+    val progressRatio = (completed.toFloat() / total.coerceAtLeast(1)).coerceIn(0f, 1f)
+    val expandRotation by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
+        label = "friend-achievement-expand"
+    )
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .cuteClickable(onClick = onClick),
+        color = TouchColors.Surface,
+        shape = RoundedCornerShape(8.dp),
+        shadowElevation = 3.dp
+    ) {
+        Row(
+            modifier = Modifier.padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            FriendAvatar(user = group.friend, authApiClient = authApiClient, size = 48)
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = group.friend.displayName,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = TouchColors.TextStrong,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = if (expanded) "\u6536\u8d77" else "\u5c55\u5f00",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TouchColors.Primary,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "\u2304",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = TouchColors.Primary,
+                            modifier = Modifier.graphicsLayer(rotationZ = expandRotation)
+                        )
+                    }
+                }
+                Text(
+                    text = "\u5df2\u70b9\u4eae ${completed}/${total} \u679a\u7f81\u7eca\u5fbd\u7ae0",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TouchColors.TextMuted
+                )
+                AchievementProgressBar(
+                    progressRatio = progressRatio,
+                    color = TouchColors.Primary,
+                    unlocked = completed == total && total > 0
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AchievementDetailDialog(
+    achievement: Achievement,
+    authApiClient: AuthApiClient,
+    onDismiss: () -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            color = TouchColors.Surface,
+            shape = RoundedCornerShape(12.dp),
+            shadowElevation = 8.dp
+        ) {
+            Column(
+                modifier = Modifier.padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    AchievementMedal(
+                        code = achievement.code,
+                        rarity = achievement.rarity,
+                        unlocked = achievement.unlocked,
+                        size = 82
+                    )
+                    achievement.friend?.let { friend ->
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .size(30.dp)
+                        ) {
+                            FriendAvatar(user = friend, authApiClient = authApiClient, size = 30)
+                        }
+                    }
+                }
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    Text(
+                        text = achievement.title,
+                        style = MaterialTheme.typography.titleLarge,
+                        color = TouchColors.TextStrong,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
+                    )
+                    Text(
+                        text = achievement.friend?.let { "${it.displayName} · ${achievement.description}" } ?: achievement.description,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TouchColors.TextMuted,
+                        textAlign = TextAlign.Center
+                    )
+                }
+                AchievementMetric(
+                    label = if (achievement.level > 0) "\u6700\u8fd1\u5347\u7ea7" else "\u5f53\u524d\u8fdb\u5ea6",
+                    value = if (achievement.level > 0) formatAchievementUnlockedAt(achievement.upgradedAt ?: achievement.unlockedAt) else "${achievement.progress}/${achievement.target}",
+                    modifier = Modifier.fillMaxWidth()
+                )
+                AchievementMetric(
+                    label = "\u5f53\u524d\u9636\u6bb5",
+                    value = if (achievement.level > 0) "Lv.${achievement.level} ${achievement.stageTitle}" else "\u5c1a\u672a\u70b9\u4eae",
+                    modifier = Modifier.fillMaxWidth()
+                )
+                TextButton(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.textButtonColors(contentColor = TouchColors.Primary)
+                ) {
+                    Text("\u77e5\u9053\u4e86")
+                }
+            }
+        }
+    }
+}
+
+private fun formatAchievementUnlockedAt(unlockedAt: Long?): String {
+    if (unlockedAt == null || unlockedAt <= 0L) return "\u5df2\u8fbe\u6210"
+    return SimpleDateFormat("yyyy.MM.dd HH:mm", Locale.getDefault()).format(Date(unlockedAt * 1000L))
+}
+
+private fun androidx.compose.foundation.lazy.LazyListScope.itemsWithKeys(
+    items: List<Achievement>,
+    keyPrefix: String,
+    itemContent: @Composable (Achievement) -> Unit
+) {
+    items.forEach { achievement ->
+        item(key = "$keyPrefix-${achievement.code}-${achievement.friend?.userId.orEmpty()}") {
+            itemContent(achievement)
+        }
+    }
+}
+
+@Composable
+private fun AchievementHeroCard(
+    summary: AchievementSummary,
+    recent: Achievement?
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = TouchColors.Surface,
+        shape = RoundedCornerShape(8.dp),
+        shadowElevation = 4.dp
+    ) {
+        Box(modifier = Modifier.height(172.dp)) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawCircle(
+                    color = TouchColors.Primary.copy(alpha = 0.12f),
+                    radius = size.minDimension * 0.62f,
+                    center = Offset(size.width * 0.86f, size.height * 0.1f)
+                )
+                drawCircle(
+                    color = TouchColors.Accent.copy(alpha = 0.16f),
+                    radius = size.minDimension * 0.42f,
+                    center = Offset(size.width * 0.12f, size.height * 1.0f)
+                )
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.Top
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = "\u5fbd\u7ae0\u9986",
+                            style = MaterialTheme.typography.titleLarge,
+                            color = TouchColors.TextStrong,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = recent?.let { "\u6700\u8fd1\u5347\u7ea7\uff1a${it.title} Lv.${it.level}" } ?: "\u7b2c\u4e00\u679a\u5fbd\u7ae0\u6b63\u5728\u7b49\u4f60",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TouchColors.TextMuted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    AchievementMedal(
+                        code = recent?.code ?: "recent",
+                        rarity = recent?.rarity ?: "rare",
+                        unlocked = recent != null,
+                        size = 58
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    AchievementMetric("\u5df2\u70b9\u4eae", "${summary.unlocked}", Modifier.weight(1f))
+                    AchievementMetric("\u6700\u9ad8\u7b49\u7ea7", "Lv.${summary.highestLevel}", Modifier.weight(1f))
+                    AchievementMetric("\u7f81\u7eca", "${summary.friendUnlocked}", Modifier.weight(1f))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AchievementMetric(label: String, value: String, modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier,
+        color = TouchColors.DetailSurface.copy(alpha = 0.82f),
+        shape = RoundedCornerShape(8.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 9.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(value, style = MaterialTheme.typography.titleMedium, color = TouchColors.TextStrong, fontWeight = FontWeight.Bold)
+            Text(label, style = MaterialTheme.typography.labelSmall, color = TouchColors.TextMuted)
+        }
+    }
+}
+
+@Composable
+private fun AchievementSectionHeader(title: String, count: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.Bottom
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleLarge,
+            color = TouchColors.TextStrong,
+            fontWeight = FontWeight.Bold
+        )
+        Text(
+            text = count,
+            style = MaterialTheme.typography.labelLarge,
+            color = TouchColors.TextMuted,
+            fontWeight = FontWeight.SemiBold
+        )
+    }
+}
+
+@Composable
+private fun AchievementCard(
+    achievement: Achievement,
+    authApiClient: AuthApiClient,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val progressRatio = (achievement.progress.toFloat() / achievement.target.coerceAtLeast(1)).coerceIn(0f, 1f)
+    val rarityColor = achievementRarityColor(achievement.rarity)
+    Surface(
+        modifier = modifier.cuteClickable(onClick = onClick),
+        color = if (achievement.unlocked) TouchColors.Surface else TouchColors.DetailSurface,
+        shape = RoundedCornerShape(8.dp),
+        shadowElevation = if (achievement.unlocked) 3.dp else 1.dp
+    ) {
+        Box {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawCircle(
+                    color = rarityColor.copy(alpha = if (achievement.unlocked) 0.12f else 0.07f),
+                    radius = size.minDimension * 0.34f,
+                    center = Offset(size.width * 0.98f, size.height * 0.06f)
+                )
+                drawCircle(
+                    color = Color.White.copy(alpha = if (achievement.unlocked) 0.38f else 0.2f),
+                    radius = size.minDimension * 0.075f,
+                    center = Offset(size.width * 0.18f, size.height * 0.22f)
+                )
+            }
+        Row(
+            modifier = Modifier.padding(13.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                AchievementMedal(
+                    code = achievement.code,
+                    rarity = achievement.rarity,
+                    unlocked = achievement.unlocked,
+                    size = 54
+                )
+                if (achievement.friend != null) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .size(24.dp)
+                    ) {
+                        FriendAvatar(user = achievement.friend, authApiClient = authApiClient, size = 24)
+                    }
+                }
+            }
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = achievement.title,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = TouchColors.TextStrong,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = if (achievement.level > 0) "Lv.${achievement.level}" else "\u672a\u70b9\u4eae",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = rarityColor,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                Text(
+                    text = achievement.friend?.let { "${it.displayName} · ${achievement.description}" } ?: achievement.description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TouchColors.TextMuted,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                AchievementProgressBar(
+                    progressRatio = progressRatio,
+                    color = rarityColor,
+                    unlocked = achievement.unlocked
+                )
+                Text(
+                    text = if (achievement.level >= achievement.maxLevel) {
+                        "\u5df2\u6ee1\u7ea7 \u00b7 ${achievement.stageTitle}"
+                    } else {
+                        "${achievement.stageTitle} \u00b7 ${achievement.progress}/${achievement.target}"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (achievement.unlocked) rarityColor else TouchColors.TextMuted,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+        }
+    }
+}
+
+@Composable
+private fun AchievementProgressBar(
+    progressRatio: Float,
+    color: Color,
+    unlocked: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val animatedProgress by animateFloatAsState(
+        targetValue = progressRatio.coerceIn(0f, 1f),
+        animationSpec = tween(durationMillis = 420, easing = FastOutSlowInEasing),
+        label = "achievement-progress"
+    )
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(8.dp)
+            .clip(RoundedCornerShape(50))
+            .background(TouchColors.CalendarTile)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxHeight()
+                .fillMaxWidth(animatedProgress.coerceAtLeast(0.03f))
+                .clip(RoundedCornerShape(50))
+                .background(color.copy(alpha = if (unlocked) 0.94f else 0.64f))
+        )
+        if (unlocked) {
+            Box(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .fillMaxWidth(0.28f)
+                    .background(Color.White.copy(alpha = 0.18f))
+            )
+        }
+    }
+}
+
+@Composable
+private fun AchievementMedal(code: String, rarity: String, unlocked: Boolean, size: Int) {
+    val color = achievementRarityColor(rarity)
+    val alpha = if (unlocked) 1f else 0.34f
+    val glow by rememberInfiniteTransition(label = "achievement-medal-glow").animateFloat(
+        initialValue = 0.92f,
+        targetValue = 1.08f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1800, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "achievement-medal-glow"
+    )
+    Canvas(modifier = Modifier.size(size.dp)) {
+        val width = this.size.width
+        val height = this.size.height
+        val min = this.size.minDimension
+        val ink = color.copy(alpha = alpha)
+        val soft = color.copy(alpha = 0.16f * alpha)
+        val bright = Color.White.copy(alpha = 0.9f * alpha)
+        fun p(x: Float, y: Float) = Offset(width * x, height * y)
+        fun dot(x: Float, y: Float, radius: Float = 0.045f, dotColor: Color = ink) {
+            drawCircle(dotColor, radius = min * radius, center = p(x, y))
+        }
+        fun line(a: Offset, b: Offset, stroke: Float = 0.045f, lineColor: Color = ink) {
+            drawLine(lineColor, a, b, strokeWidth = min * stroke)
+        }
+
+        drawCircle(color = soft, radius = min * 0.48f * if (unlocked) glow else 1f, center = center)
+        drawCircle(color = color.copy(alpha = 0.32f * alpha), radius = min * 0.39f, center = center, style = Stroke(width = min * 0.055f))
+        drawCircle(color = Color.White.copy(alpha = 0.18f * alpha), radius = min * 0.31f, center = center, style = Stroke(width = min * 0.018f))
+        drawCircle(color = bright.copy(alpha = 0.48f * alpha), radius = min * 0.08f, center = p(0.34f, 0.29f))
+
+        when (code) {
+            "personal_meeting_album" -> {
+                dot(0.36f, 0.54f, 0.085f)
+                dot(0.64f, 0.46f, 0.085f)
+                line(p(0.42f, 0.52f), p(0.58f, 0.48f), 0.04f)
+                line(p(0.5f, 0.27f), p(0.5f, 0.38f), 0.035f, bright)
+                line(p(0.44f, 0.325f), p(0.56f, 0.325f), 0.035f, bright)
+            }
+            "legacy_personal_friend_3" -> {
+                drawCircle(ink, radius = min * 0.16f, center = center, style = Stroke(width = min * 0.05f))
+                drawCircle(ink, radius = min * 0.27f, center = center, style = Stroke(width = min * 0.032f))
+                dot(0.28f, 0.5f, 0.035f)
+                dot(0.72f, 0.5f, 0.035f)
+                dot(0.5f, 0.23f, 0.035f)
+                dot(0.5f, 0.77f, 0.035f)
+            }
+            "legacy_personal_streak_7" -> {
+                val nodes = listOf(p(0.28f, 0.36f), p(0.46f, 0.25f), p(0.68f, 0.38f), p(0.62f, 0.66f), p(0.36f, 0.7f))
+                nodes.zipWithNext().forEach { (a, b) -> line(a, b, 0.035f) }
+                line(nodes.last(), nodes.first(), 0.035f)
+                line(nodes[1], nodes[3], 0.025f, ink.copy(alpha = 0.62f))
+                nodes.forEach { drawCircle(ink, radius = min * 0.044f, center = it) }
+            }
+            "personal_many_threads" -> {
+                val a = p(0.5f, 0.28f)
+                val b = p(0.31f, 0.65f)
+                val c = p(0.69f, 0.65f)
+                line(a, b, 0.04f)
+                line(b, c, 0.04f)
+                line(c, a, 0.04f)
+                listOf(a, b, c).forEach { drawCircle(ink, radius = min * 0.07f, center = it) }
+            }
+            "legacy_personal_event_1" -> {
+                val nodes = listOf(p(0.31f, 0.32f), p(0.53f, 0.24f), p(0.72f, 0.42f), p(0.62f, 0.68f), p(0.34f, 0.66f), p(0.45f, 0.48f))
+                listOf(0 to 1, 1 to 2, 2 to 3, 3 to 4, 4 to 0, 0 to 5, 2 to 5, 4 to 5).forEach { (from, to) -> line(nodes[from], nodes[to], 0.027f) }
+                nodes.forEachIndexed { index, node -> drawCircle(if (index == 5) bright else ink, radius = min * if (index == 5) 0.052f else 0.038f, center = node) }
+            }
+            "personal_daily_streak" -> {
+                repeat(7) { index ->
+                    val x = 0.24f + index * 0.085f
+                    dot(x, 0.68f - (index % 2) * 0.18f, 0.032f)
+                    if (index > 0) line(p(x - 0.085f, 0.68f - ((index - 1) % 2) * 0.18f), p(x, 0.68f - (index % 2) * 0.18f), 0.028f)
+                }
+                line(p(0.28f, 0.28f), p(0.72f, 0.28f), 0.035f, bright)
+            }
+            "personal_day_notes" -> {
+                line(p(0.34f, 0.27f), p(0.66f, 0.27f), 0.045f)
+                line(p(0.34f, 0.27f), p(0.34f, 0.73f), 0.045f)
+                line(p(0.66f, 0.27f), p(0.66f, 0.73f), 0.045f)
+                line(p(0.34f, 0.73f), p(0.66f, 0.73f), 0.045f)
+                line(p(0.41f, 0.43f), p(0.59f, 0.43f), 0.03f, bright)
+                line(p(0.41f, 0.55f), p(0.55f, 0.55f), 0.03f, bright)
+            }
+            "personal_photo_notes" -> {
+                line(p(0.29f, 0.31f), p(0.71f, 0.31f), 0.045f)
+                line(p(0.29f, 0.31f), p(0.29f, 0.69f), 0.045f)
+                line(p(0.71f, 0.31f), p(0.71f, 0.69f), 0.045f)
+                line(p(0.29f, 0.69f), p(0.71f, 0.69f), 0.045f)
+                line(p(0.34f, 0.64f), p(0.47f, 0.49f), 0.038f)
+                line(p(0.47f, 0.49f), p(0.57f, 0.6f), 0.038f)
+                line(p(0.57f, 0.6f), p(0.66f, 0.48f), 0.038f)
+                dot(0.61f, 0.41f, 0.035f, bright)
+            }
+            "friend_spark" -> {
+                drawCircle(ink, radius = min * 0.12f, center = p(0.41f, 0.5f), style = Stroke(width = min * 0.045f))
+                drawCircle(ink, radius = min * 0.12f, center = p(0.59f, 0.5f), style = Stroke(width = min * 0.045f))
+                dot(0.5f, 0.5f, 0.04f, bright)
+            }
+            "friend_long_light" -> {
+                listOf(p(0.5f, 0.32f), p(0.34f, 0.62f), p(0.66f, 0.62f)).forEach { node ->
+                    drawCircle(ink, radius = min * 0.09f, center = node, style = Stroke(width = min * 0.04f))
+                }
+                line(p(0.5f, 0.41f), p(0.38f, 0.56f), 0.03f)
+                line(p(0.5f, 0.41f), p(0.62f, 0.56f), 0.03f)
+                line(p(0.43f, 0.62f), p(0.57f, 0.62f), 0.03f)
+            }
+            "friend_same_frequency" -> {
+                drawCircle(ink, radius = min * 0.24f, center = center, style = Stroke(width = min * 0.035f))
+                drawCircle(ink.copy(alpha = 0.74f), radius = min * 0.15f, center = center, style = Stroke(width = min * 0.04f))
+                dot(0.34f, 0.32f, 0.04f)
+                dot(0.66f, 0.68f, 0.04f)
+                line(p(0.36f, 0.36f), p(0.64f, 0.64f), 0.028f, bright)
+            }
+            "friend_shared_notes" -> {
+                repeat(4) { index ->
+                    val x = 0.32f + index * 0.12f
+                    drawCircle(ink, radius = min * 0.075f, center = p(x, 0.43f), style = Stroke(width = min * 0.036f))
+                    drawCircle(ink, radius = min * 0.075f, center = p(x + 0.06f, 0.58f), style = Stroke(width = min * 0.036f))
+                }
+                line(p(0.32f, 0.74f), p(0.68f, 0.74f), 0.035f, bright)
+            }
+            "friend_shared_photos" -> {
+                line(p(0.31f, 0.31f), p(0.69f, 0.31f), 0.04f)
+                line(p(0.31f, 0.31f), p(0.31f, 0.7f), 0.04f)
+                line(p(0.69f, 0.31f), p(0.69f, 0.7f), 0.04f)
+                line(p(0.31f, 0.7f), p(0.69f, 0.7f), 0.04f)
+                dot(0.41f, 0.45f, 0.04f, bright)
+                dot(0.58f, 0.45f, 0.04f, bright)
+                dot(0.5f, 0.6f, 0.04f, bright)
+            }
+            else -> {
+                dot(0.5f, 0.34f, 0.06f)
+                line(p(0.5f, 0.4f), p(0.5f, 0.68f), 0.045f)
+                line(p(0.38f, 0.55f), p(0.62f, 0.55f), 0.035f)
+            }
+        }
+    }
+}
+
+private fun achievementRarityLabel(rarity: String): String {
+    return when (rarity) {
+        "common" -> "\u666e\u901a"
+        "special" -> "\u7279\u522b"
+        "rare" -> "\u7a00\u6709"
+        "epic" -> "\u53f2\u8bd7"
+        "legendary" -> "\u4f20\u8bf4"
+        else -> "\u7279\u522b"
+    }
+}
+
+@Composable
+private fun achievementRarityColor(rarity: String): Color {
+    return when (rarity) {
+        "common" -> TouchColors.TextMuted
+        "special" -> TouchColors.Primary
+        "rare" -> TouchColors.Accent
+        "epic" -> TouchColors.Warning
+        "legendary" -> TouchColors.HeatStrong
+        else -> TouchColors.Primary
     }
 }
 
@@ -2861,11 +4337,11 @@ private fun FriendSection(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = TouchColors.Surface),
         shape = RoundedCornerShape(8.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            modifier = Modifier.padding(15.dp),
+            verticalArrangement = Arrangement.spacedBy(11.dp)
         ) {
             Text(
                 text = title,
@@ -2891,8 +4367,10 @@ private fun FriendSection(
 @Composable
 private fun ConfirmRemoveFriendDialog(
     friendName: String,
+    isBlocked: Boolean,
     isBusy: Boolean,
     onCancel: () -> Unit,
+    onBlock: () -> Unit,
     onConfirm: () -> Unit
 ) {
     Dialog(onDismissRequest = onCancel) {
@@ -2902,8 +4380,10 @@ private fun ConfirmRemoveFriendDialog(
             elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
         ) {
             Column(
-                modifier = Modifier.padding(18.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
+                modifier = Modifier
+                    .width(320.dp)
+                    .padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text(
                     text = "\u5220\u9664\u597d\u53cb\uff1f",
@@ -2912,11 +4392,14 @@ private fun ConfirmRemoveFriendDialog(
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "\u5220\u9664 $friendName \u540e\uff0c\u4f60\u5c06\u4e0d\u518d\u770b\u5230\u4e0e\u8be5\u597d\u53cb\u76f8\u5173\u7684\u89c1\u9762\u8bb0\u5f55\uff1b\u53ea\u6709\u8be5\u597d\u53cb\u53c2\u4e0e\u7684\u4e8b\u4ef6\u4e5f\u4f1a\u4ece\u4f60\u7684\u5217\u8868\u4e2d\u9690\u85cf\u3002",
+                    text = "\u5220\u9664 $friendName \u540e\uff0c\u76f8\u5173\u89c1\u9762\u8bb0\u5f55\u548c\u4ec5\u5305\u542b\u8be5\u597d\u53cb\u7684\u4e8b\u4ef6\u5c06\u4ece\u4f60\u7684\u89c6\u56fe\u9690\u85cf\u3002\u6682\u65f6\u4e0d\u60f3\u770b\u5230\u6216\u8bb0\u5f55\u78b0\u4e00\u78b0\u65f6\uff0c\u53ef\u4ee5\u5148\u9009\u62e9\u5c4f\u853d\u3002",
                     style = MaterialTheme.typography.bodyMedium,
                     color = TouchColors.TextMuted
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     OutlinedButton(
                         onClick = onCancel,
                         enabled = !isBusy,
@@ -2927,14 +4410,23 @@ private fun ConfirmRemoveFriendDialog(
                         Text("\u53d6\u6d88")
                     }
                     Button(
-                        onClick = onConfirm,
+                        onClick = onBlock,
                         enabled = !isBusy,
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(8.dp),
-                        colors = touchDangerButtonColors()
+                        colors = touchSecondaryButtonColors()
                     ) {
-                        Text(if (isBusy) "\u5220\u9664\u4e2d..." else "\u786e\u8ba4\u5220\u9664")
+                        Text(if (isBlocked) "\u53d6\u6d88\u5c4f\u853d" else "\u5c4f\u853d")
                     }
+                }
+                Button(
+                    onClick = onConfirm,
+                    enabled = !isBusy,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(8.dp),
+                    colors = touchDangerButtonColors()
+                ) {
+                    Text(if (isBusy) "\u5220\u9664\u4e2d..." else "\u786e\u8ba4\u5220\u9664")
                 }
             }
         }
@@ -2945,18 +4437,19 @@ private fun ConfirmRemoveFriendDialog(
 private fun FriendUserRow(
     user: FriendUser,
     authApiClient: AuthApiClient,
-    subtitle: String = user.email,
+    subtitle: String = user.email ?: "",
     onAvatarClick: (() -> Unit)? = null,
     trailing: @Composable (() -> Unit)? = null
 ) {
     Surface(
         color = TouchColors.DetailSurface,
-        shape = RoundedCornerShape(8.dp)
+        shape = RoundedCornerShape(8.dp),
+        shadowElevation = 1.dp
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(10.dp),
+                .padding(horizontal = 11.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             FriendAvatar(
@@ -3279,20 +4772,25 @@ private fun MeetingCalendar(
         }
     }
 
-    Card(
+    Box(
         modifier = Modifier
             .fillMaxWidth()
-            .animateContentSize(
-                animationSpec = tween(CALENDAR_SIZE_ANIMATION_MS, easing = FastOutSlowInEasing)
-            ),
-        colors = CardDefaults.cardColors(containerColor = TouchColors.Surface),
-        shape = RoundedCornerShape(8.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+            .padding(vertical = 12.dp)
     ) {
-        Column(
-            modifier = Modifier.padding(18.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = TouchColors.Surface),
+            shape = RoundedCornerShape(8.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = 3.dp)
         ) {
+            Column(
+                modifier = Modifier
+                    .animateContentSize(
+                        animationSpec = tween(CALENDAR_SIZE_ANIMATION_MS, easing = FastOutSlowInEasing)
+                    )
+                    .padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -3502,6 +5000,7 @@ private fun MeetingCalendar(
             ) {
                 Box(
                     modifier = Modifier
+                        .padding(horizontal = 8.dp, vertical = 8.dp)
                         .animateContentSize(
                             animationSpec = tween(CALENDAR_SIZE_ANIMATION_MS, easing = FastOutSlowInEasing)
                         )
@@ -3574,6 +5073,7 @@ private fun MeetingCalendar(
                 }
             }
         }
+    }
     }
 }
 
@@ -3744,7 +5244,7 @@ private fun WeekCalendarView(
             .fillMaxWidth()
             .nestedScroll(edgeNestedScrollConnection)
             .horizontalScroll(scrollState)
-            .padding(bottom = 5.dp)
+            .padding(horizontal = 4.dp, vertical = 7.dp)
             .graphicsLayer {
                 translationX = visualEdgeOffset + reboundVisualOffset.value
             },
@@ -5210,6 +6710,44 @@ private fun DayEventDto.toDayEvent(): DayEvent {
     )
 }
 
+private fun AchievementResponseDto.toAchievementState(): AchievementState {
+    return AchievementState(
+        summary = summary.toAchievementSummary(),
+        personal = personal.map { it.toAchievement() },
+        friendAchievements = friendAchievements.map { it.toAchievement() }
+    )
+}
+
+private fun AchievementSummaryDto.toAchievementSummary(): AchievementSummary {
+    return AchievementSummary(
+        unlocked = unlocked,
+        total = total,
+        personalUnlocked = personalUnlocked,
+        friendUnlocked = friendUnlocked,
+        highestLevel = highestLevel
+    )
+}
+
+private fun AchievementDto.toAchievement(): Achievement {
+    return Achievement(
+        code = code,
+        type = type,
+        title = title,
+        description = description,
+        rarity = rarity,
+        progress = progress,
+        target = target,
+        unlocked = unlocked,
+        unlockedAt = unlockedAt,
+        friend = friend?.toFriendUser(),
+        level = level,
+        maxLevel = maxLevel,
+        stageTitle = stageTitle,
+        nextTarget = nextTarget,
+        upgradedAt = upgradedAt
+    )
+}
+
 private fun meetingHeatColor(count: Int): Color {
     return when {
         count <= 1 -> TouchColors.HeatLow
@@ -5424,13 +6962,7 @@ private fun MeetingFriendAvatar(
                     .background(TouchColors.Avatar),
                 contentAlignment = Alignment.Center
             ) {
-                Text(
-                    text = displayName.take(1).ifBlank { "T" },
-                    style = MaterialTheme.typography.labelSmall,
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center
-                )
+                AvatarInitials(text = displayName.take(1).ifBlank { "T" }, size = size)
             }
         }
     }
@@ -5528,6 +7060,7 @@ private fun RealtimeNoticePulse(
     val color = when (kind) {
         RealtimeNoticeKind.Meeting -> TouchColors.Primary
         RealtimeNoticeKind.Friend -> TouchColors.Accent
+        RealtimeNoticeKind.Achievement -> TouchColors.Warning
         RealtimeNoticeKind.Neutral -> TouchColors.Secondary
     }
     Canvas(modifier = modifier) {
@@ -5564,6 +7097,29 @@ private fun TapProgressDialog(
     onSendFriendRequest: (FriendUser) -> Unit,
     onDismiss: () -> Unit
 ) {
+    val title = when (mode) {
+        TapDialogMode.Unified -> "\u5f00\u59cb\u78b0\u4e00\u78b0"
+        TapDialogMode.ShowMine -> "\u663e\u793a\u6211\u7684\u78b0\u4e00\u78b0"
+        TapDialogMode.ScanOther -> "\u78b0\u4e00\u78b0\u522b\u4eba"
+    }
+    val stageText = when {
+        statusIsError -> "\u9700\u8981\u5904\u7406"
+        statusText.startsWith("\u5df2\u786e\u8ba4") -> "\u5df2\u5b8c\u6210"
+        statusText.contains("\u670d\u52a1\u5668\u786e\u8ba4") -> "\u6b63\u5728\u786e\u8ba4"
+        isPreparing -> "\u6b63\u5728\u51c6\u5907"
+        mode == TapDialogMode.Unified && isScanning -> "\u7b49\u5f85\u9760\u8fd1"
+        mode == TapDialogMode.ScanOther && isScanning -> "\u6b63\u5728\u626b\u63cf"
+        mode == TapDialogMode.ShowMine -> "\u7b49\u5f85\u5bf9\u65b9\u9760\u8fd1"
+        else -> "\u7b49\u5f85\u8bfb\u53d6"
+    }
+    val subtitle = when (mode) {
+        TapDialogMode.Unified -> "\u9760\u8fd1\u53e6\u4e00\u90e8\u624b\u673a\u7684 NFC \u533a\u57df\uff0c\u4fdd\u6301 1-2 \u79d2"
+        TapDialogMode.ShowMine -> "\u4f60\u7684 Touch \u4fe1\u53f7\u6b63\u5728\u524d\u53f0\u7b49\u5f85\u8bfb\u53d6"
+        TapDialogMode.ScanOther -> "\u5c06\u624b\u673a\u8d34\u8fd1\u5bf9\u65b9\u7684 NFC \u533a\u57df"
+    }
+    val stageColor = if (statusIsError) TouchColors.Error else TouchColors.Primary
+    val stageSurface = if (statusIsError) TouchColors.ErrorSoft else TouchColors.CalendarToday
+
     Dialog(onDismissRequest = onDismiss) {
         AnimatedVisibility(
             visible = true,
@@ -5571,60 +7127,154 @@ private fun TapProgressDialog(
                 scaleIn(tween(INLINE_ENTER_MS, easing = FastOutSlowInEasing), initialScale = 0.98f)
         ) {
             Card(
-                colors = CardDefaults.cardColors(containerColor = TouchColors.Surface),
+                colors = CardDefaults.cardColors(containerColor = TouchColors.Surface.copy(alpha = 0.98f)),
                 shape = RoundedCornerShape(8.dp),
-                elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+                elevation = CardDefaults.cardElevation(defaultElevation = 12.dp)
             ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 22.dp, vertical = 20.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                        .padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    Text(
-                        text = when (mode) {
-                            TapDialogMode.ShowMine -> "\u663e\u793a\u6211\u7684\u78b0\u4e00\u78b0"
-                            TapDialogMode.ScanOther -> "\u78b0\u4e00\u78b0\u522b\u4eba"
-                        },
-                        style = MaterialTheme.typography.titleLarge,
-                        color = TouchColors.TextStrong,
-                        fontWeight = FontWeight.Bold
-                    )
-                    TapWaveAnimation(
-                        mode = mode,
-                        statusIsError = statusIsError,
-                        modifier = Modifier
-                            .fillMaxWidth(0.74f)
-                            .aspectRatio(1f)
-                    )
-                    Text(
-                        text = when {
-                            statusIsError -> "\u9700\u8981\u5904\u7406"
-                            statusText.startsWith("\u5df2\u786e\u8ba4") -> "\u5df2\u786e\u8ba4"
-                            statusText.contains("\u670d\u52a1\u5668\u786e\u8ba4") -> "\u6b63\u5728\u786e\u8ba4"
-                            isPreparing -> "\u6b63\u5728\u51c6\u5907"
-                            mode == TapDialogMode.ScanOther && isScanning -> "\u6b63\u5728\u626b\u63cf"
-                            mode == TapDialogMode.ShowMine -> "\u7b49\u5f85\u5bf9\u65b9\u9760\u8fd1"
-                            else -> "\u7b49\u5f85\u8bfb\u53d6"
-                        },
-                        style = MaterialTheme.typography.titleMedium,
-                        color = if (statusIsError) TouchColors.Error else TouchColors.Primary,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Text(
-                        text = statusText,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = TouchColors.TextMuted
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Surface(
+                            modifier = Modifier.size(42.dp),
+                            color = stageSurface,
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Canvas(modifier = Modifier.fillMaxSize()) {
+                                val c = center
+                                drawCircle(
+                                    color = stageColor.copy(alpha = 0.18f),
+                                    radius = size.minDimension * 0.33f,
+                                    center = c
+                                )
+                                drawCircle(
+                                    color = stageColor,
+                                    radius = size.minDimension * 0.15f,
+                                    center = c
+                                )
+                                drawCircle(
+                                    color = Color.White.copy(alpha = 0.92f),
+                                    radius = size.minDimension * 0.055f,
+                                    center = c
+                                )
+                            }
+                        }
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(3.dp)
+                        ) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(7.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = title,
+                                    style = MaterialTheme.typography.titleLarge,
+                                    color = TouchColors.TextStrong,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Surface(
+                                    color = stageSurface,
+                                    shape = RoundedCornerShape(8.dp)
+                                ) {
+                                    Text(
+                                        text = stageText,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = stageColor,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+                            Text(
+                                text = subtitle,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TouchColors.TextMuted,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = TouchColors.DetailSurface,
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 18.dp, vertical = 14.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            TapWaveAnimation(
+                                mode = mode,
+                                statusIsError = statusIsError,
+                                modifier = Modifier
+                                    .fillMaxWidth(0.78f)
+                                    .aspectRatio(1f)
+                            )
+                        }
+                    }
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = stageSurface.copy(alpha = 0.72f),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Canvas(modifier = Modifier.size(22.dp)) {
+                                drawCircle(
+                                    color = stageColor.copy(alpha = 0.16f),
+                                    radius = size.minDimension * 0.48f,
+                                    center = center
+                                )
+                                drawCircle(
+                                    color = stageColor,
+                                    radius = size.minDimension * 0.18f,
+                                    center = center
+                                )
+                            }
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text(
+                                    text = stageText,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = stageColor,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = statusText,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TouchColors.TextMuted,
+                                    maxLines = 3,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
                     if (pendingFriendPrompt != null) {
                         Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        color = TouchColors.WarningSoft,
-                        shape = RoundedCornerShape(8.dp)
+                            modifier = Modifier.fillMaxWidth(),
+                            color = TouchColors.WarningSoft,
+                            shape = RoundedCornerShape(8.dp)
                         ) {
                             Column(
-                                modifier = Modifier.padding(12.dp),
+                                modifier = Modifier.padding(13.dp),
                                 verticalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
                                 Text(
@@ -5652,6 +7302,7 @@ private fun TapProgressDialog(
                     ) {
                         Text(
                             text = when (mode) {
+                                TapDialogMode.Unified -> "\u505c\u6b62\u78b0\u4e00\u78b0"
                                 TapDialogMode.ShowMine -> "\u6536\u8d77\u5e76\u505c\u6b62\u663e\u793a"
                                 TapDialogMode.ScanOther -> "\u505c\u6b62\u626b\u63cf"
                             },
@@ -5682,52 +7333,96 @@ private fun TapWaveAnimation(
     )
     val waveColor = when {
         statusIsError -> TouchColors.Error
+        mode == TapDialogMode.Unified -> TouchColors.Primary
         mode == TapDialogMode.ShowMine -> TouchColors.Primary
         else -> TouchColors.Avatar
     }
-    val accentColor = if (mode == TapDialogMode.ShowMine) TouchColors.Avatar else TouchColors.Primary
+    val accentColor = if (mode == TapDialogMode.ScanOther) TouchColors.Primary else TouchColors.Accent
 
     Canvas(modifier = modifier) {
-        val minRadius = size.minDimension * 0.13f
-        val maxRadius = size.minDimension * 0.46f
-        drawCircle(
-            color = waveColor.copy(alpha = 0.08f),
-            radius = maxRadius,
-            center = center
-        )
-        repeat(4) { index ->
-            val phase = (progress + index * 0.25f) % 1f
-            val radius = if (mode == TapDialogMode.ShowMine) {
-                minRadius + (maxRadius - minRadius) * phase
-            } else {
-                maxRadius - (maxRadius - minRadius) * phase
+        val minSide = size.minDimension
+        val minRadius = minSide * 0.14f
+        val maxRadius = minSide * 0.44f
+        repeat(3) { index ->
+            val baseRadius = minSide * (0.24f + index * 0.095f)
+            drawCircle(
+                color = waveColor.copy(alpha = 0.055f - index * 0.008f),
+                radius = baseRadius,
+                center = center,
+                style = Stroke(width = minSide * 0.018f)
+            )
+        }
+        repeat(5) { index ->
+            val phase = (progress + index * 0.20f) % 1f
+            val radius = when (mode) {
+                TapDialogMode.ScanOther -> maxRadius - (maxRadius - minRadius) * phase
+                TapDialogMode.Unified -> if (index % 2 == 0) {
+                    minRadius + (maxRadius - minRadius) * phase
+                } else {
+                    maxRadius - (maxRadius - minRadius) * phase
+                }
+                TapDialogMode.ShowMine -> minRadius + (maxRadius - minRadius) * phase
             }
-            val alpha = if (mode == TapDialogMode.ShowMine) {
-                0.42f * (1f - phase)
-            } else {
-                0.12f + 0.30f * phase
+            val alpha = when (mode) {
+                TapDialogMode.ScanOther -> 0.08f + 0.28f * phase
+                TapDialogMode.Unified -> 0.30f * (1f - abs(phase - 0.5f) * 1.45f)
+                TapDialogMode.ShowMine -> 0.36f * (1f - phase)
             }
             drawCircle(
-                color = waveColor.copy(alpha = alpha.coerceIn(0.08f, 0.42f)),
+                color = if (index % 2 == 0) {
+                    waveColor.copy(alpha = alpha.coerceIn(0.05f, 0.34f))
+                } else {
+                    accentColor.copy(alpha = alpha.coerceIn(0.04f, 0.26f))
+                },
                 radius = radius,
                 center = center,
-                style = Stroke(width = size.minDimension * 0.018f)
+                style = Stroke(width = minSide * (0.012f + index * 0.0014f))
             )
         }
         drawCircle(
-            color = accentColor.copy(alpha = 0.16f),
-            radius = size.minDimension * 0.18f,
+            color = Color.White.copy(alpha = 0.82f),
+            radius = minSide * 0.19f,
             center = center
         )
+        drawCircle(
+            color = waveColor.copy(alpha = 0.14f),
+            radius = minSide * 0.18f,
+            center = center,
+            style = Stroke(width = minSide * 0.018f)
+        )
+        drawCircle(
+            color = accentColor.copy(alpha = 0.10f),
+            radius = minSide * 0.125f,
+            center = center
+        )
+        repeat(3) { index ->
+            val phase = (progress + index / 3f) % 1f
+            val angle = (phase * 6.28318f) + index * 0.7f
+            val orbit = minSide * 0.155f
+            drawCircle(
+                color = if (index == 1) accentColor else waveColor,
+                radius = minSide * (0.012f + index * 0.002f),
+                center = Offset(
+                    x = center.x + kotlin.math.cos(angle) * orbit,
+                    y = center.y + kotlin.math.sin(angle) * orbit
+                )
+            )
+        }
         drawCircle(
             color = waveColor,
-            radius = size.minDimension * 0.075f,
+            radius = minSide * 0.060f,
             center = center
         )
         drawCircle(
-            color = Color.White.copy(alpha = 0.90f),
-            radius = size.minDimension * 0.030f,
+            color = Color.White.copy(alpha = 0.94f),
+            radius = minSide * 0.024f,
             center = center
+        )
+        drawCircle(
+            color = waveColor.copy(alpha = 0.24f),
+            radius = minSide * 0.075f,
+            center = center,
+            style = Stroke(width = minSide * 0.008f)
         )
     }
 }
@@ -5739,20 +7434,17 @@ private fun PrimaryActions(
     isReady: Boolean,
     isPreparing: Boolean,
     isScanning: Boolean,
-    onShowMine: () -> Unit,
-    onScanOther: () -> Unit
+    onStartTap: () -> Unit
 ) {
-    val showMineInteraction = remember { MutableInteractionSource() }
-    val scanOtherInteraction = remember { MutableInteractionSource() }
-    val showMineScale = rememberCutePressScale(showMineInteraction)
-    val scanOtherScale = rememberCutePressScale(scanOtherInteraction)
+    val tapInteraction = remember { MutableInteractionSource() }
+    val tapScale = rememberCutePressScale(tapInteraction)
 
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Surface(
             modifier = Modifier.fillMaxWidth(),
             color = if (statusIsError) TouchColors.ErrorSoft else TouchColors.SuccessSoft,
             shape = RoundedCornerShape(8.dp),
-            shadowElevation = 2.dp
+            shadowElevation = 3.dp
         ) {
             Text(
                 text = statusText,
@@ -5763,43 +7455,26 @@ private fun PrimaryActions(
             )
         }
         Button(
-            onClick = onShowMine,
+            onClick = onStartTap,
             enabled = isReady && !isPreparing,
-            interactionSource = showMineInteraction,
+            interactionSource = tapInteraction,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(58.dp)
                 .graphicsLayer {
-                    scaleX = showMineScale
-                    scaleY = showMineScale
+                    scaleX = tapScale
+                    scaleY = tapScale
             },
             shape = RoundedCornerShape(8.dp),
             elevation = ButtonDefaults.buttonElevation(defaultElevation = 5.dp, pressedElevation = 1.dp),
             colors = touchPrimaryButtonColors()
         ) {
             Text(
-                text = if (isPreparing) "\u6b63\u5728\u51c6\u5907..." else "\u663e\u793a\u6211\u7684\u78b0\u4e00\u78b0",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold
-            )
-        }
-        Button(
-            onClick = onScanOther,
-            enabled = isReady && !isPreparing,
-            interactionSource = scanOtherInteraction,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(58.dp)
-                .graphicsLayer {
-                    scaleX = scanOtherScale
-                    scaleY = scanOtherScale
-            },
-            shape = RoundedCornerShape(8.dp),
-            elevation = ButtonDefaults.buttonElevation(defaultElevation = 5.dp, pressedElevation = 1.dp),
-            colors = touchSecondaryButtonColors()
-        ) {
-            Text(
-                text = if (isScanning) "\u505c\u6b62\u626b\u63cf" else "\u78b0\u4e00\u78b0\u522b\u4eba",
+                text = when {
+                    isPreparing -> "\u6b63\u5728\u51c6\u5907..."
+                    isScanning -> "\u505c\u6b62\u78b0\u4e00\u78b0"
+                    else -> "\u5f00\u59cb\u78b0\u4e00\u78b0"
+                },
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold
             )
@@ -5842,10 +7517,11 @@ private fun SummaryMetric(
     Surface(
         modifier = modifier,
         color = TouchColors.Surface,
-        shape = RoundedCornerShape(8.dp)
+        shape = RoundedCornerShape(8.dp),
+        shadowElevation = 2.dp
     ) {
         Column(
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 13.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             Text(
@@ -5895,7 +7571,7 @@ private fun MeetingRow(meeting: MeetingPreview) {
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = TouchColors.Surface),
         shape = RoundedCornerShape(8.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Row(
             modifier = Modifier.padding(14.dp),
@@ -5942,12 +7618,7 @@ private fun InitialsAvatar(name: String) {
             .background(TouchColors.Avatar),
         contentAlignment = Alignment.Center
     ) {
-        Text(
-            text = initials,
-            style = MaterialTheme.typography.labelLarge,
-            color = Color.White,
-            fontWeight = FontWeight.Bold
-        )
+        AvatarInitials(text = initials, size = 44)
     }
 }
 
@@ -5955,6 +7626,7 @@ private fun InitialsAvatar(name: String) {
 private fun FriendAvatar(
     user: FriendUser,
     authApiClient: AuthApiClient,
+    size: Int = 44,
     modifier: Modifier = Modifier
 ) {
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
@@ -5976,7 +7648,7 @@ private fun FriendAvatar(
 
     Box(
         modifier = modifier
-            .size(44.dp)
+            .size(size.dp)
             .clip(CircleShape)
             .background(TouchColors.Avatar),
         contentAlignment = Alignment.Center
@@ -5989,12 +7661,7 @@ private fun FriendAvatar(
                 contentScale = ContentScale.Crop
             )
         } else {
-            Text(
-                text = user.displayName.take(2).ifBlank { "TC" },
-                style = MaterialTheme.typography.labelLarge,
-                color = Color.White,
-                fontWeight = FontWeight.Bold
-            )
+            AvatarInitials(text = user.displayName.take(2).ifBlank { "TC" }, size = size)
         }
     }
 }
@@ -6020,14 +7687,31 @@ private fun AccountAvatar(
                 contentScale = ContentScale.Crop
             )
         } else {
-            Text(
-                text = name.take(2).ifBlank { "TC" },
-                style = MaterialTheme.typography.labelLarge,
-                color = Color.White,
-                fontWeight = FontWeight.Bold
-            )
+            AvatarInitials(text = name.take(2).ifBlank { "TC" }, size = 52)
         }
     }
+}
+
+@Composable
+private fun AvatarInitials(text: String, size: Int) {
+    val actualText = text.ifBlank { "T" }
+    val fontSize = (size * if (actualText.length <= 1) 0.38f else 0.31f).sp
+    val lineHeight = (size * 0.42f).sp
+    Text(
+        text = actualText,
+        modifier = Modifier
+            .fillMaxSize()
+            .wrapContentSize(Alignment.Center),
+        style = MaterialTheme.typography.labelLarge.copy(
+            fontSize = fontSize,
+            lineHeight = lineHeight,
+            platformStyle = PlatformTextStyle(includeFontPadding = false)
+        ),
+        color = Color.White,
+        fontWeight = FontWeight.Bold,
+        textAlign = TextAlign.Center,
+        maxLines = 1
+    )
 }
 
 @Composable

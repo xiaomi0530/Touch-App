@@ -59,6 +59,8 @@ def main() -> None:
     suffix = int(time.time())
     email = f"dev{suffix}@example.com"
     password = "password123"
+    demo_email = os.environ.get("TOUCH_DEMO_EMAIL", "").strip()
+    demo_password = os.environ.get("TOUCH_DEMO_PASSWORD", "").strip()
 
     health = request("GET", "/health")
     print("health:", health["status"])
@@ -198,10 +200,11 @@ def main() -> None:
     events_after_delete = request("GET", f"/day-events?date={proof['meeting']['metDate']}", token=scanner["accessToken"])
     print("day_event_delete:", delete_event["status"], len(events_after_delete["events"]))
 
-    seeded = request("POST", "/auth/login", {"email": "test@163.com", "password": "12345678"})
-    seeded_meetings = request("GET", "/meetings", token=seeded["accessToken"])
-    print("seeded_user:", seeded["user"]["displayName"])
-    print("seeded_meetings:", len(seeded_meetings["meetings"]))
+    if demo_email and demo_password:
+        seeded = request("POST", "/auth/login", {"email": demo_email, "password": demo_password})
+        seeded_meetings = request("GET", "/meetings", token=seeded["accessToken"])
+        print("seeded_user:", seeded["user"]["displayName"])
+        print("seeded_meetings:", len(seeded_meetings["meetings"]))
 
 
 if __name__ == "__main__":

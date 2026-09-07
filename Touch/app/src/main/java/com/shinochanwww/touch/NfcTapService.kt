@@ -22,13 +22,28 @@ private val SELECT_TOUCH_AID = byteArrayOf(
     0x00.toByte(),
     0x00.toByte()
 )
+private val SELECT_TOUCH_AID_PREFIX = byteArrayOf(
+    0x00.toByte(),
+    0xA4.toByte(),
+    0x04.toByte(),
+    0x00.toByte(),
+    0x07.toByte(),
+    0xF0.toByte(),
+    0x39.toByte(),
+    0x41.toByte(),
+    0x48.toByte(),
+    0x14.toByte(),
+    0x81.toByte(),
+    0x00.toByte()
+)
 
 class NfcTapService : HostApduService() {
     override fun processCommandApdu(commandApdu: ByteArray?, extras: Bundle?): ByteArray {
-        if (commandApdu == null || !commandApdu.contentEquals(SELECT_TOUCH_AID)) {
+        if (commandApdu == null || !isTouchSelectAid(commandApdu)) {
             return STATUS_NOT_FOUND
         }
         val payload = currentPayload ?: return STATUS_CONDITIONS_NOT_SATISFIED
+        onPayloadServed?.invoke()
         return payload.toByteArray(StandardCharsets.UTF_8) + STATUS_SUCCESS
     }
 
@@ -36,6 +51,7 @@ class NfcTapService : HostApduService() {
 
     companion object {
         private var currentPayload: String? = null
+        private var onPayloadServed: (() -> Unit)? = null
 
         fun setPayload(payload: String) {
             currentPayload = payload
@@ -43,6 +59,16 @@ class NfcTapService : HostApduService() {
 
         fun clearPayload() {
             currentPayload = null
+        }
+
+        fun setPayloadServedListener(listener: (() -> Unit)?) {
+            onPayloadServed = listener
+        }
+
+        private fun isTouchSelectAid(command: ByteArray): Boolean {
+            return command.contentEquals(SELECT_TOUCH_AID) ||
+                (command.size >= SELECT_TOUCH_AID_PREFIX.size &&
+                    command.copyOfRange(0, SELECT_TOUCH_AID_PREFIX.size).contentEquals(SELECT_TOUCH_AID_PREFIX))
         }
     }
 }

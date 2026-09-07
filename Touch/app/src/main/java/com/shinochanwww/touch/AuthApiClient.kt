@@ -14,7 +14,7 @@ import java.net.URL
 import java.net.URLEncoder
 import java.util.UUID
 
-private const val DEFAULT_BASE_URL = "http://47.100.48.119"
+private const val DEFAULT_BASE_URL = "http://10.0.2.2:8000"
 
 data class AuthenticatedSession(
     val userId: String,
@@ -57,7 +57,7 @@ data class MeetingRecordDto(
 data class FriendUserDto(
     val userId: String,
     val displayName: String,
-    val email: String,
+    val email: String?,
     val avatarUrl: String?,
     val bio: String?,
     val birthday: String?,
@@ -104,6 +104,38 @@ data class RealtimeEventDto(
     val type: String,
     val payload: JSONObject,
     val createdAt: Long
+)
+
+data class AchievementDto(
+    val code: String,
+    val type: String,
+    val title: String,
+    val description: String,
+    val rarity: String,
+    val progress: Int,
+    val target: Int,
+    val unlocked: Boolean,
+    val unlockedAt: Long?,
+    val friend: FriendUserDto?,
+    val level: Int,
+    val maxLevel: Int,
+    val stageTitle: String,
+    val nextTarget: Int?,
+    val upgradedAt: Long?
+)
+
+data class AchievementSummaryDto(
+    val unlocked: Int,
+    val total: Int,
+    val personalUnlocked: Int,
+    val friendUnlocked: Int,
+    val highestLevel: Int
+)
+
+data class AchievementResponseDto(
+    val summary: AchievementSummaryDto,
+    val personal: List<AchievementDto>,
+    val friendAchievements: List<AchievementDto>
 )
 
 class AuthApiException(message: String) : Exception(message)
@@ -501,6 +533,34 @@ class AuthApiClient(
         }
     }
 
+    fun getAchievements(accessToken: String): AchievementResponseDto {
+        val json = requestWithoutBody("GET", "/badges", accessToken)
+        val summary = json.getJSONObject("summary")
+        val personalArray = json.getJSONArray("personal")
+        val friendGroups = json.getJSONArray("friendBadges")
+        val friendBadges = mutableListOf<AchievementDto>()
+        for (groupIndex in 0 until friendGroups.length()) {
+            val group = friendGroups.getJSONObject(groupIndex)
+            val badges = group.getJSONArray("badges")
+            for (badgeIndex in 0 until badges.length()) {
+                friendBadges += parseAchievement(badges.getJSONObject(badgeIndex))
+            }
+        }
+        return AchievementResponseDto(
+            summary = AchievementSummaryDto(
+                unlocked = summary.optInt("lit", 0),
+                total = summary.optInt("total", 0),
+                personalUnlocked = summary.optInt("personalLit", 0),
+                friendUnlocked = summary.optInt("friendLit", 0),
+                highestLevel = summary.optInt("highestLevel", 0)
+            ),
+            personal = (0 until personalArray.length()).map { index ->
+                parseAchievement(personalArray.getJSONObject(index))
+            },
+            friendAchievements = friendBadges
+        )
+    }
+
     private fun requestWithoutBody(
         method: String,
         path: String,
@@ -619,7 +679,7 @@ class AuthApiClient(
         return FriendUserDto(
             userId = json.getString("id"),
             displayName = json.getString("displayName"),
-            email = json.getString("email"),
+            email = json.optString("email").takeIf { it.isNotBlank() && it != "null" },
             avatarUrl = json.optString("avatarUrl").takeIf { it.isNotBlank() && it != "null" },
             bio = json.optString("bio").takeIf { it.isNotBlank() && it != "null" },
             birthday = json.optString("birthday").takeIf { it.isNotBlank() && it != "null" },
@@ -667,6 +727,26 @@ class AuthApiClient(
             type = json.getString("type"),
             payload = json.optJSONObject("payload") ?: JSONObject(),
             createdAt = json.optLong("createdAt", 0L)
+        )
+    }
+
+    private fun parseAchievement(json: JSONObject): AchievementDto {
+        return AchievementDto(
+            code = json.getString("code"),
+            type = json.getString("type"),
+            title = json.getString("title"),
+            description = json.getString("description"),
+            rarity = json.getString("rarity"),
+            progress = json.optInt("progress", 0),
+            target = json.optInt("nextTarget", 0).takeIf { it > 0 } ?: json.optInt("currentTarget", 1),
+            unlocked = json.optBoolean("lit", json.optBoolean("unlocked", false)),
+            unlockedAt = json.optLong("litAt", json.optLong("unlockedAt", 0L)).takeIf { it > 0L },
+            friend = json.optJSONObject("friend")?.let { parseFriendUser(it) },
+            level = json.optInt("level", if (json.optBoolean("unlocked", false)) 1 else 0),
+            maxLevel = json.optInt("maxLevel", 1),
+            stageTitle = json.optString("stageTitle").takeIf { it.isNotBlank() } ?: "\u5c1a\u672a\u70b9\u4eae",
+            nextTarget = json.optInt("nextTarget", 0).takeIf { it > 0 },
+            upgradedAt = json.optLong("upgradedAt", 0L).takeIf { it > 0L }
         )
     }
 

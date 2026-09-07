@@ -20,6 +20,7 @@ The system must be designed from the beginning for security, privacy, reliabilit
 6. Always design network and NFC operations as failure-prone and retryable.
 7. Always prefer explicit, auditable state transitions over implicit side effects.
 8. Always update this specification when changing architecture, security assumptions, or core flows.
+9. Features touching friends, file uploads, email, account sessions, NFC proof, or day events must follow `SECURITY_STRATEGY.md` and identify whether handled data is public, friend-visible, private, sensitive, or secret.
 
 ## Target Platform
 
@@ -292,6 +293,7 @@ Friend management requirements:
 - Users can delete an accepted friend relationship.
 - Deleting a friend must require a confirmation dialog. After deletion, the deleted friend must no longer appear in that user's meeting history or personal day-event participant lists. Events that only contain the deleted friend should be hidden from that user; events with other still-active friends should remain visible with the deleted friend removed from the participant display.
 - Users can block or unblock a friend for touch interactions.
+- The accepted-friend list should not show a separate always-visible block button. Blocking or unblocking should be offered inside the delete-friend confirmation dialog as a less destructive alternative alongside cancel and confirm delete.
 - Users can set a private remark for an accepted friend. Remarks are viewer-specific and must be stored server-side, not only in local UI state.
 - The friends page can open a friend card from an accepted friend's avatar. The card should show friend identity, the viewer's remark, and recent meeting counts with that friend.
 - Friend cards should also show the friend's cloud-backed public profile card fields: avatar, card background, bio, birthday, gender, and last-seen time.
@@ -321,6 +323,94 @@ Security rules:
 - The Android client must not locally create confirmed records for non-friend taps.
 - The NFC payload must still avoid permanent identifiers; friend-required decisions happen only after backend token validation resolves the tapped account.
 - Friend search must not expose internal-only secrets or authentication tokens.
+- Email is private account data for login/recovery and must not be returned in friend search, friend cards, meeting participants, day-event participants, or realtime friend payloads.
+
+## Badge System
+
+The app has a fourth bottom-level page named `Badges`, but the core reward model is now a staged badge system rather than one-time achievement honors. Badges should feel closer to QQ-style interaction marks or sparks: long-lived, collectible, and upgradeable through repeated meaningful interaction.
+
+Badge requirements:
+
+- Badge levels must be backend-authoritative. The Android client may render progress and notices, but must not locally decide that a badge is lit or upgraded.
+- Badges are split into personal badges and friend-bond badges.
+- Each badge has 3-5 stages. The current first-phase system uses five stages: `微光初现`, `星火新燃`, `清辉渐盛`, `流光相映`, and `长明不息`.
+- Personal badges derive from confirmed meeting count, unique accepted-friend meeting count, confirmed meeting streaks, saved day-event activity, and image-backed day-event activity.
+- Friend-bond badges derive from confirmed meetings with one accepted friend, consecutive-day streaks with that friend, recent interaction frequency, shared day events, and image-backed shared day events.
+- Badge progress must be calculated from server-confirmed meetings and server-confirmed day events only.
+- Removed friends must not continue to expose friend-bond badges or private friend metadata to that user. Friend-bond badge responses should be scoped to currently accepted friends in normal API responses.
+- After a friend is deleted, the Android UI must immediately hide that friend's friend-bond badge rows using the current accepted-friend cache, then refresh authoritative badge state from the backend.
+- Badge payloads may include friend-visible profile fields for accepted friends, but must not include email, account secrets, authentication tokens, NFC tokens, or raw internal audit data.
+- Badge state updates must be idempotent. Re-evaluating badges after repeated sync, proof retry, or app restart must not create duplicate lit or upgrade records.
+- The backend may emit realtime `badge_lit` and `badge_upgraded` events after creating a new badge state or level increase. The client must treat realtime events as notification hints and refresh authoritative badge state from `GET /badges`.
+- The achievements page should render as a polished badge gallery: high-quality cards, clear level/progress, restrained theme-managed color, and no cheap or noisy gamification.
+- Unfinished personal badges should appear before max-level personal badges. The bottom max-level group is only for personal badges; friend-bond badges must stay inside their corresponding friend expansion and must not be duplicated in the global max-level section.
+- Friend-bond badges should first appear as friend summary cards showing lit count versus total count. Tapping a friend summary expands that friend's badge rows. Within a friend expansion, unfinished badges appear first sorted by next-stage progress, and max-level badges appear at the bottom sorted by upgrade time.
+- Badge artwork should use distinct, code-specific icon drawings instead of reusing one generic medal or relying on centered text labels. Icons should remain lightweight, theme-aware, and visually readable at small card sizes. Tapping a badge/card should open a detail dialog that shows the badge description, current stage, progress, and upgrade time.
+- Badge page motion should feel premium but stay low-cost: progress bars should ease toward new values, friend-bond expansion indicators may rotate subtly, lit badges may use restrained glow/highlight motion, and card backgrounds may use static low-alpha theme shapes. Avoid large layout shifts, heavy image assets, or constant full-screen animation.
+
+Current first-phase badges:
+
+```text
+Personal:
+- 逢迹成册: total confirmed meetings, stages 1 / 10 / 50 / 100 / 365
+- 千线相连: unique met friends, stages 1 / 3 / 10 / 30 / 100
+- 朝夕不辍: confirmed meeting day streak, stages 3 / 7 / 14 / 30 / 60
+- 浮生日笺: saved day events, stages 1 / 5 / 20 / 50 / 100
+- 光影留痕: saved image-backed day events, stages 1 / 5 / 20 / 50 / 100
+
+Friend-bond:
+- 星火渐燃: meetings with this friend, stages 1 / 3 / 10 / 30 / 100
+- 长明相伴: consecutive meeting days with this friend, stages 3 / 7 / 14 / 30 / 60
+- 同频共振: recent meetings with this friend, stages 2 / 3 / 5 / 15 / 25
+- 同写一页: shared day events with this friend, stages 1 / 3 / 10 / 30 / 60
+- 并影成章: image-backed shared day events with this friend, stages 1 / 5 / 15 / 30 / 60
+```
+
+Current badge endpoints:
+
+```text
+GET /badges
+```
+
+## Note Photo Transfer
+
+The app includes a top-level transfer page for quickly preparing classroom note/PPT photos on the phone. The current design is local-only and intentionally removes the previous backend/desktop transfer mode.
+
+Product requirements:
+
+- The Android client selects images from the phone gallery and preserves the user-selected order as the document order.
+- The Android client generates a zip locally on the phone and names entries deterministically as `0001.jpg`, `0002.jpg`, etc.
+- The zip should be created by streaming image data from content URIs; do not decode all selected images into memory.
+- Before writing an image into the zip, the Android client should keep images at or below 5 MB. Images already at or below 5 MB should be copied as-is. Images over 5 MB should be locally recompressed with minimal practical quality loss, preferring modest resolution reduction and high-quality JPEG output until the result is below 5 MB.
+- Because phone photos are already compressed, local zip generation may use no-compression zip entries to reduce CPU time for large batches.
+- After generation, the user can share the zip through the Android system share sheet, including WeChat if installed, or save it through the Android document picker.
+- The feature must not upload note photos to the Touch backend and must not require the desktop helper tool.
+- This feature is independent of friend/meeting history and must not expose note photos to friends or public profile APIs.
+
+Security requirements:
+
+- Note photos are sensitive private user content.
+- Note photos stay local to the phone unless the user explicitly shares or saves the generated zip through Android system UI.
+- Generated zip files are temporary cache files exposed to other apps only through `FileProvider` with one-time read grants.
+- Do not log selected image URIs, original filenames, zip contents, or attachment bytes.
+- Any future reintroduction of cloud transfer must update this specification and `SECURITY_STRATEGY.md` before code changes.
+
+## File Upload, Email, and Enterprise Security
+
+The detailed security roadmap for friend privacy, file upload handling, email exposure, session storage, deployment hardening, and production encryption is maintained in:
+
+```text
+SECURITY_STRATEGY.md
+```
+
+Current production-hardening requirements:
+
+- Production traffic must be HTTPS-only; the temporary HTTP ECS backend is for real-device testing only.
+- Android refresh tokens must move from plain private `SharedPreferences` to Keystore-backed encrypted storage before production.
+- Public/friend-visible user serializers must not include email. The current backend has separate private account and public profile serializers; do not merge them.
+- Uploaded images must be decoded, re-encoded, metadata-stripped, size-limited, and served through safe authorization-aware paths or signed URLs according to their data class.
+- Day-event images must move out of base64 JSON storage before production.
+- Friend operations, upload endpoints, auth endpoints, meet-token creation, proof submission, and realtime streams must have rate limits and auditable security events.
 
 ## API Design Guidelines
 
@@ -352,8 +442,9 @@ Backend responses should distinguish:
 
 The app must clearly separate:
 
-- "Show my tap code" mode
-- "Tap someone" scanning mode
+- A unified user-facing "Start tap" flow
+- Internal HCE token-serving state
+- Internal ReaderMode scanning state
 - Pending meeting records
 - Confirmed meeting records
 - Failed attempts
@@ -369,6 +460,15 @@ The tap screen should make readiness obvious:
 
 Do not claim a meeting is recorded until backend confirmation succeeds.
 
+NFC interaction requirements:
+
+- The user-facing NFC workflow should prefer one unified "start tap" action. Internally the app may run both HCE token serving and ReaderMode scanning, and whichever side succeeds first must stop the other side.
+- Reader mode should minimize accidental system card/payment handling by using Touch HCE reader flags, skipping NDEF checks, suppressing platform sounds, and disabling reader mode immediately after a Touch payload is read.
+- HCE APDU SELECT matching must tolerate standard SELECT AID variants such as optional trailing `Le` bytes so different Android devices can read each other reliably.
+- The scanning user must get an immediate local success notice after server confirmation, without relying only on realtime SSE.
+- The tapped user's foreground UI must show an immediate "payload read, waiting for confirmation" notice when the HCE payload is served, then rely on backend realtime/polling for the confirmed meeting notice.
+- UI copy should tell users to align the NFC areas of both phones and hold steady for about 1-2 seconds.
+
 Current interaction style:
 
 - Major panel switches should prefer short Crossfade or fade-only transitions.
@@ -378,6 +478,7 @@ Current interaction style:
 - Keep account editing and calendar details visually inline with the main page unless the user explicitly asks for modal behavior.
 - The app uses a bottom three-tab structure: main screen, friends, and mine. Friend management belongs in the friends tab, and account/user management belongs in the mine tab.
 - The bottom three-tab bar should feel like a polished app navigation control, not plain form buttons: use a floating rounded container, subtle theme-colored active state, compact glyphs, restrained motion, and globally theme-managed colors.
+- Profile-card editing should provide a clear secondary discard action near save. Discarding must close the editor and restore unsaved draft text/background preview state without submitting profile changes.
 - Calendar friend filtering should stay compact. Prefer a small muted text selector that expands into a lightweight scrollable rectangle over always showing many friend filter buttons.
 - Calendar friend filtering should sit on the same horizontal level as the active date/range label. Selecting a friend filter must not immediately close the filter list; it should remain open until the user taps elsewhere, then close with a restrained slower fade/slide exit. Filtering should use local cached meeting records so the calendar does not briefly flash through empty/today colors while awaiting a network refresh.
 - Calendar month/year cells should show people counts only in the all-friends view. When filtered to one friend, cells should use the one-person heat color and omit `x人` count labels.
@@ -407,13 +508,16 @@ Current interaction style:
 - Calendar week/month/year mode changes should animate with fade plus light scale.
 - Calendar content should support horizontal swipe navigation: in week view swipe left/right moves to the next/previous week, in month view to the next/previous month, and in year view to the next/previous year.
 - Calendar week view must render a natural Monday-to-Sunday week and must not truncate at month boundaries.
+- Elevated calendar panels and week day cards must reserve enough drawing space for shadows without narrowing the visible main card width relative to sibling page cards. Do not place shadowed cards flush against scroll or animation container bounds where elevation can be visibly clipped.
 - The app supports three user-selectable visual palettes from the Mine page: Muelsyse, Shu, and Mizuki. The selected palette is stored locally and should apply globally after switching.
 - Buttons, text buttons, and outlined buttons must use theme-managed colors from the current `TouchColors` palette, including disabled states. Avoid default Material button text colors when they produce pure black text or overly pale text against the active visual theme.
+- The current Touch visual system is a light card-based palette. Do not allow Android system dark mode or dynamic colors to make Material input text, labels, or controls use low-contrast light colors on the app's light surfaces. Text entered in every input field must remain clearly visible.
 - Mizuki is the default palette.
 - Muelsyse uses cool mint, aqua, ivory, deep teal-gray, and restrained pale gold accents.
 - Shu uses warmer rice-field tones: olive green, grain gold, ivory, muted earth, and calm tea-gold heat states.
 - Mizuki uses cooler oceanic tones: deep sea blue, blue-violet, luminous aqua, pale mist background, and lavender emphasis.
 - Avoid harsh high-saturation cartoon green/red palettes. Error colors should use muted coral or muted violet only where warning semantics require it. Keep the UI cute and animated, but make the overall color impression clean, coordinated, and characterful. Avoid allowing Android dynamic color to override the app's intentional brand colors.
+- Main, Friends, and Mine pages should share a restrained premium visual language: consistent page headers, lightly elevated white cards, quiet spacing, subtle theme-colored accents, and no decorative elements that feel generic or AI-generated. Keep the existing palette choices intact unless the user explicitly asks to change colors.
 
 ## Testing Requirements
 
@@ -516,7 +620,7 @@ Local backend properties:
 - The current Android client persists the authenticated session in private `SharedPreferences` so login survives app restarts until explicit logout.
 - On startup, the current Android client restores the saved session immediately and attempts to refresh it through `POST /auth/refresh`.
 - Persistent secure token storage with Android Keystore or EncryptedSharedPreferences has not been implemented yet.
-- The local backend seeds a development account `test@163.com` with password `12345678`, display name `Shinochanwww`, and demo meeting records for UI testing.
+- The local backend can optionally seed demo data when explicitly enabled through environment variables.
 - The seeded development account also has accepted demo friends. Demo meeting records are bound to those demo friend user IDs so the friend management page and calendar friend filter can be tested with the seeded data.
 
 Local backend limitations:
@@ -536,7 +640,7 @@ Do not expose the local backend directly to the internet. Production deployment 
 The app is currently configured to call the deployed Alibaba Cloud ECS backend at:
 
 ```text
-http://47.100.48.119
+<development-backend-url>
 ```
 
 This is a temporary HTTP deployment for real-device connectivity testing. The Android manifest currently allows cleartext traffic so the app can call this server before a domain and TLS certificate are configured.

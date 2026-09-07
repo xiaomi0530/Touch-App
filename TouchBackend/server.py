@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -8,6 +9,7 @@ import mimetypes
 import os
 import secrets
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -33,6 +35,124 @@ MAX_AVATAR_BYTES = 2 * 1024 * 1024
 MAX_CARD_BACKGROUND_BYTES = 3 * 1024 * 1024
 MEET_TOKEN_TTL_SECONDS = 120
 DEFAULT_CARD_BACKGROUND_KEYS = {"mizuki", "muelsyse", "shu"}
+CORS_ALLOW_ORIGIN = os.environ.get("TOUCH_CORS_ALLOW_ORIGIN", "*")
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_BUCKETS: dict[tuple[str, str], list[int]] = {}
+RATE_LIMIT_LOCK = threading.Lock()
+RATE_LIMIT_RULES = {
+    ("POST", "/auth/register"): (5, "auth"),
+    ("POST", "/auth/login"): (10, "auth"),
+    ("POST", "/auth/refresh"): (30, "auth"),
+    ("GET", "/friends/search"): (30, "friend_search"),
+    ("POST", "/friends/requests"): (20, "friend_mutation"),
+    ("POST", "/friends/requests/respond"): (30, "friend_mutation"),
+    ("POST", "/friends/remove"): (20, "friend_mutation"),
+    ("POST", "/friends/block"): (30, "friend_mutation"),
+    ("POST", "/friends/remark"): (30, "friend_mutation"),
+    ("POST", "/account/avatar"): (10, "upload"),
+    ("POST", "/account/card-background"): (10, "upload"),
+    ("POST", "/meet-tokens"): (30, "tap"),
+    ("POST", "/meetings/proofs"): (60, "tap"),
+    ("GET", "/events/stream"): (10, "realtime"),
+}
+ENABLE_DEMO_DATA = os.environ.get("TOUCH_ENABLE_DEMO_DATA", "").lower() in {"1", "true", "yes", "on"}
+
+BADGE_STAGE_TITLES = ["\u5fae\u5149\u521d\u73b0", "\u661f\u706b\u65b0\u71c3", "\u6e05\u8f89\u6e10\u76db", "\u6d41\u5149\u76f8\u6620", "\u957f\u660e\u4e0d\u606f"]
+
+BADGE_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "code": "personal_meeting_album",
+        "type": "personal",
+        "title": "\u9022\u8ff9\u6210\u518c",
+        "description": "\u628a\u6bcf\u4e00\u6b21\u6210\u529f\u78b0\u4e00\u78b0\u6536\u8fdb\u81ea\u5df1\u7684\u76f8\u9022\u8f68\u8ff9",
+        "rarity": "common",
+        "metric": "total_meetings",
+        "stages": [1, 10, 50, 100, 365],
+    },
+    {
+        "code": "personal_many_threads",
+        "type": "personal",
+        "title": "\u5343\u7ebf\u76f8\u8fde",
+        "description": "\u548c\u66f4\u591a\u4e0d\u540c\u597d\u53cb\u7559\u4e0b\u89c1\u9762\u8bb0\u5f55",
+        "rarity": "special",
+        "metric": "unique_friends",
+        "stages": [1, 3, 10, 30, 100],
+    },
+    {
+        "code": "personal_daily_streak",
+        "type": "personal",
+        "title": "\u671d\u5915\u4e0d\u8f8d",
+        "description": "\u8fde\u7eed\u591a\u5929\u62e5\u6709\u786e\u8ba4\u540e\u7684\u78b0\u4e00\u78b0\u8bb0\u5f55",
+        "rarity": "rare",
+        "metric": "daily_streak",
+        "stages": [3, 7, 14, 30, 60],
+    },
+    {
+        "code": "personal_day_notes",
+        "type": "personal",
+        "title": "\u6d6e\u751f\u65e5\u7b3a",
+        "description": "\u8bb0\u5f55\u66f4\u591a\u4eca\u5929\u53d1\u751f\u7684\u4e8b",
+        "rarity": "common",
+        "metric": "event_count",
+        "stages": [1, 5, 20, 50, 100],
+    },
+    {
+        "code": "personal_photo_notes",
+        "type": "personal",
+        "title": "\u5149\u5f71\u7559\u75d5",
+        "description": "\u7528\u5e26\u56fe\u7247\u7684\u4e8b\u4ef6\u7559\u4e0b\u6e05\u6670\u56de\u5fc6",
+        "rarity": "special",
+        "metric": "event_image_count",
+        "stages": [1, 5, 20, 50, 100],
+    },
+    {
+        "code": "friend_spark",
+        "type": "friend",
+        "title": "\u661f\u706b\u6e10\u71c3",
+        "description": "\u548c\u8fd9\u4f4d\u597d\u53cb\u4ece\u521d\u6b21\u76f8\u9022\u5230\u719f\u6089\u76f8\u89c1",
+        "rarity": "common",
+        "metric": "friend_meetings",
+        "stages": [1, 3, 10, 30, 100],
+    },
+    {
+        "code": "friend_long_light",
+        "type": "friend",
+        "title": "\u957f\u660e\u76f8\u4f34",
+        "description": "\u548c\u8fd9\u4f4d\u597d\u53cb\u8fde\u7eed\u591a\u5929\u6210\u529f\u89c1\u9762",
+        "rarity": "epic",
+        "metric": "friend_daily_streak",
+        "stages": [3, 7, 14, 30, 60],
+    },
+    {
+        "code": "friend_same_frequency",
+        "type": "friend",
+        "title": "\u540c\u9891\u5171\u632f",
+        "description": "\u8fd1\u671f\u548c\u8fd9\u4f4d\u597d\u53cb\u4fdd\u6301\u9ad8\u9891\u76f8\u89c1",
+        "rarity": "rare",
+        "metric": "friend_recent_30_meetings",
+        "stages": [2, 3, 5, 15, 25],
+    },
+    {
+        "code": "friend_shared_notes",
+        "type": "friend",
+        "title": "\u540c\u5199\u4e00\u9875",
+        "description": "\u548c\u8fd9\u4f4d\u597d\u53cb\u5171\u540c\u53c2\u4e0e\u66f4\u591a\u4e8b\u4ef6\u8bb0\u5f55",
+        "rarity": "special",
+        "metric": "friend_event_count",
+        "stages": [1, 3, 10, 30, 60],
+    },
+    {
+        "code": "friend_shared_photos",
+        "type": "friend",
+        "title": "\u5e76\u5f71\u6210\u7ae0",
+        "description": "\u548c\u8fd9\u4f4d\u597d\u53cb\u7559\u4e0b\u66f4\u591a\u5e26\u56fe\u7247\u7684\u5171\u540c\u4e8b\u4ef6",
+        "rarity": "rare",
+        "metric": "friend_event_image_count",
+        "stages": [1, 5, 15, 30, 60],
+    },
+]
+
+ACHIEVEMENT_DEFINITIONS = BADGE_DEFINITIONS
 
 
 def utc_now() -> int:
@@ -269,6 +389,28 @@ def init_db() -> None:
                 payload_json TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS achievement_unlocks (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                achievement_code TEXT NOT NULL,
+                friend_user_id TEXT NOT NULL DEFAULT '',
+                unlocked_at INTEGER NOT NULL,
+                UNIQUE(user_id, achievement_code, friend_user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS badge_states (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                badge_code TEXT NOT NULL,
+                friend_user_id TEXT NOT NULL DEFAULT '',
+                level INTEGER NOT NULL,
+                progress INTEGER NOT NULL,
+                lit_at INTEGER,
+                upgraded_at INTEGER NOT NULL,
+                UNIQUE(user_id, badge_code, friend_user_id)
+            );
+
             """
         )
         columns = {row["name"] for row in db.execute("PRAGMA table_info(users)").fetchall()}
@@ -292,7 +434,8 @@ def init_db() -> None:
             db.execute("ALTER TABLE friendships ADD COLUMN requester_remark TEXT")
         if "addressee_remark" not in friendship_columns:
             db.execute("ALTER TABLE friendships ADD COLUMN addressee_remark TEXT")
-        seed_local_demo_user(db)
+        if ENABLE_DEMO_DATA:
+            seed_local_demo_user(db)
 
 
 def normalize_email(email: str) -> str:
@@ -324,6 +467,13 @@ def user_from_row(row: sqlite3.Row) -> User:
 
 
 def public_user(user: User) -> dict[str, Any]:
+    payload = public_profile_user(user)
+    payload["email"] = user.email
+    payload["createdAt"] = user.created_at
+    return payload
+
+
+def public_profile_user(user: User) -> dict[str, Any]:
     avatar_url = f"/uploads/avatars/{user.avatar_path}" if user.avatar_path else None
     card_background_url = (
         f"/uploads/card-backgrounds/{user.card_background_path}"
@@ -333,8 +483,6 @@ def public_user(user: User) -> dict[str, Any]:
     return {
         "id": user.id,
         "displayName": user.display_name,
-        "email": user.email,
-        "createdAt": user.created_at,
         "avatarUrl": avatar_url,
         "bio": user.bio,
         "birthday": user.birthday,
@@ -347,6 +495,10 @@ def public_user(user: User) -> dict[str, Any]:
 
 def public_user_row(row: sqlite3.Row) -> dict[str, Any]:
     return public_user(user_from_row(row))
+
+
+def public_profile_user_row(row: sqlite3.Row) -> dict[str, Any]:
+    return public_profile_user(user_from_row(row))
 
 
 def display_name_is_taken(db: sqlite3.Connection, display_name: str, excluding_user_id: str | None = None) -> bool:
@@ -463,7 +615,7 @@ def public_friendship(db: sqlite3.Connection, row: sqlite3.Row, viewer_user_id: 
         "id": row["id"],
         "status": row["status"],
         "direction": "outgoing" if row["requester_user_id"] == viewer_user_id else "incoming",
-        "friend": public_user_row(user_row) if user_row else None,
+        "friend": public_profile_user_row(user_row) if user_row else None,
         "remark": remark,
         "blockedByMe": blocked_by_me,
         "blockedMe": blocked_me,
@@ -491,7 +643,7 @@ def public_day_event(db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]
         "note": row["note"],
         "imageBase64": images[0] if images else None,
         "imageBase64List": images,
-        "participants": [public_user_row(participant) for participant in participant_rows],
+        "participants": [public_profile_user_row(participant) for participant in participant_rows],
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
     }
@@ -586,10 +738,423 @@ def parse_event_images(raw: str | None) -> list[str]:
     return []
 
 
+def longest_date_streak(date_values: list[str]) -> int:
+    if not date_values:
+        return 0
+    day_numbers = sorted({days_since_epoch_like(value) for value in date_values if len(value) == 10})
+    if not day_numbers:
+        return 0
+    best = 1
+    current = 1
+    previous = day_numbers[0]
+    for value in day_numbers[1:]:
+        if value == previous + 1:
+            current += 1
+        else:
+            current = 1
+        best = max(best, current)
+        previous = value
+    return best
+
+
+def days_since_epoch_like(date_value: str) -> int:
+    try:
+        year = int(date_value[0:4])
+        month = int(date_value[5:7])
+        day = int(date_value[8:10])
+    except ValueError:
+        return 0
+    total = 0
+    for candidate in range(1970, year):
+        total += 366 if is_leap_year(candidate) else 365
+    month_days = [31, 29 if is_leap_year(year) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    total += sum(month_days[: max(0, month - 1)])
+    return total + day
+
+
+def is_leap_year(year: int) -> bool:
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+
+
+def badge_definition(code: str) -> dict[str, Any]:
+    return next(item for item in BADGE_DEFINITIONS if item["code"] == code)
+
+
+def achievement_definition(code: str) -> dict[str, Any]:
+    return badge_definition(code)
+
+
+def accepted_friend_rows(db: sqlite3.Connection, user_id: str) -> list[sqlite3.Row]:
+    return db.execute(
+        """
+        SELECT users.*
+        FROM friendships
+        JOIN users ON users.id = CASE
+            WHEN friendships.requester_user_id = ? THEN friendships.addressee_user_id
+            ELSE friendships.requester_user_id
+        END
+        WHERE friendships.status = 'accepted'
+          AND (friendships.requester_user_id = ? OR friendships.addressee_user_id = ?)
+        ORDER BY users.display_name ASC
+        """,
+        (user_id, user_id, user_id),
+    ).fetchall()
+
+
+def compute_badge_progress(
+    db: sqlite3.Connection,
+    user_id: str,
+    definition: dict[str, Any],
+    friend_user_id: str | None = None,
+) -> int:
+    metric = definition["metric"]
+    if metric == "total_meetings":
+        row = db.execute(
+            "SELECT COUNT(*) AS count FROM meetings WHERE owner_user_id = ? AND status = 'confirmed'",
+            (user_id,),
+        ).fetchone()
+        return int(row["count"] or 0)
+    if metric == "unique_friends":
+        row = db.execute(
+            """
+            SELECT COUNT(DISTINCT person_user_id) AS count
+            FROM meetings
+            WHERE owner_user_id = ? AND status = 'confirmed' AND person_user_id IS NOT NULL
+            """,
+            (user_id,),
+        ).fetchone()
+        return int(row["count"] or 0)
+    if metric == "daily_streak":
+        rows = db.execute(
+            "SELECT DISTINCT met_date FROM meetings WHERE owner_user_id = ? AND status = 'confirmed'",
+            (user_id,),
+        ).fetchall()
+        return longest_date_streak([row["met_date"] for row in rows])
+    if metric == "event_count":
+        row = db.execute(
+            "SELECT COUNT(*) AS count FROM day_events WHERE owner_user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return int(row["count"] or 0)
+    if metric == "event_image_count":
+        rows = db.execute(
+            "SELECT image_base64 FROM day_events WHERE owner_user_id = ? AND image_base64 IS NOT NULL",
+            (user_id,),
+        ).fetchall()
+        return sum(1 for row in rows if parse_event_images(row["image_base64"]))
+    if not friend_user_id:
+        return 0
+    if metric == "friend_meetings":
+        row = db.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM meetings
+            WHERE owner_user_id = ? AND person_user_id = ? AND status = 'confirmed'
+            """,
+            (user_id, friend_user_id),
+        ).fetchone()
+        return int(row["count"] or 0)
+    if metric == "friend_daily_streak":
+        rows = db.execute(
+            """
+            SELECT DISTINCT met_date
+            FROM meetings
+            WHERE owner_user_id = ? AND person_user_id = ? AND status = 'confirmed'
+            """,
+            (user_id, friend_user_id),
+        ).fetchall()
+        return longest_date_streak([row["met_date"] for row in rows])
+    if metric == "friend_recent_30_meetings":
+        rows = db.execute(
+            """
+            SELECT met_date
+            FROM meetings
+            WHERE owner_user_id = ? AND person_user_id = ? AND status = 'confirmed'
+            ORDER BY met_date DESC
+            """,
+            (user_id, friend_user_id),
+        ).fetchall()
+        day_numbers = [days_since_epoch_like(row["met_date"]) for row in rows]
+        if not day_numbers:
+            return 0
+        newest = max(day_numbers)
+        return len([value for value in day_numbers if newest - value <= 29])
+    if metric == "friend_event_count":
+        row = db.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM day_events
+            JOIN day_event_participants ON day_event_participants.event_id = day_events.id
+            WHERE day_events.owner_user_id = ? AND day_event_participants.friend_user_id = ?
+            """,
+            (user_id, friend_user_id),
+        ).fetchone()
+        return int(row["count"] or 0)
+    if metric == "friend_event_image_count":
+        rows = db.execute(
+            """
+            SELECT day_events.image_base64
+            FROM day_events
+            JOIN day_event_participants ON day_event_participants.event_id = day_events.id
+            WHERE day_events.owner_user_id = ?
+              AND day_event_participants.friend_user_id = ?
+              AND day_events.image_base64 IS NOT NULL
+            """,
+            (user_id, friend_user_id),
+        ).fetchall()
+        return sum(1 for row in rows if parse_event_images(row["image_base64"]))
+    return 0
+
+
+def compute_achievement_progress(
+    db: sqlite3.Connection,
+    user_id: str,
+    definition: dict[str, Any],
+    friend_user_id: str | None = None,
+) -> int:
+    return compute_badge_progress(db, user_id, definition, friend_user_id)
+
+
+def badge_level_for_progress(definition: dict[str, Any], progress: int) -> int:
+    stages = [int(value) for value in definition["stages"]]
+    return sum(1 for target in stages if progress >= target)
+
+
+def badge_stage_payload(definition: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {"level": index + 1, "title": BADGE_STAGE_TITLES[index], "target": int(target)}
+        for index, target in enumerate(definition["stages"])
+    ]
+
+
+def badge_payload(
+    db: sqlite3.Connection,
+    user_id: str,
+    definition: dict[str, Any],
+    friend_row: sqlite3.Row | None = None,
+) -> dict[str, Any]:
+    friend_user_id = friend_row["id"] if friend_row is not None else ""
+    progress = compute_badge_progress(db, user_id, definition, friend_user_id or None)
+    stages = [int(value) for value in definition["stages"]]
+    level = badge_level_for_progress(definition, progress)
+    state = db.execute(
+        """
+        SELECT * FROM badge_states
+        WHERE user_id = ? AND badge_code = ? AND friend_user_id = ?
+        """,
+        (user_id, definition["code"], friend_user_id),
+    ).fetchone()
+    stored_level = int(state["level"] or 0) if state else 0
+    effective_level = max(level, stored_level)
+    current_target = stages[min(max(effective_level, 1), len(stages)) - 1]
+    next_target = stages[effective_level] if effective_level < len(stages) else None
+    stage_title = BADGE_STAGE_TITLES[effective_level - 1] if effective_level > 0 else "\u5c1a\u672a\u70b9\u4eae"
+    return {
+        "code": definition["code"],
+        "type": definition["type"],
+        "title": definition["title"],
+        "description": definition["description"],
+        "rarity": definition["rarity"],
+        "level": effective_level,
+        "maxLevel": len(stages),
+        "stageTitle": stage_title,
+        "progress": progress,
+        "currentTarget": current_target,
+        "nextTarget": next_target,
+        "lit": effective_level > 0,
+        "litAt": state["lit_at"] if state else None,
+        "upgradedAt": state["upgraded_at"] if state else None,
+        "stages": badge_stage_payload(definition),
+        "friend": public_profile_user_row(friend_row) if friend_row is not None else None,
+    }
+
+
+def achievement_payload(
+    db: sqlite3.Connection,
+    user_id: str,
+    definition: dict[str, Any],
+    friend_row: sqlite3.Row | None = None,
+) -> dict[str, Any]:
+    payload = badge_payload(db, user_id, definition, friend_row)
+    target = payload["nextTarget"] or payload["currentTarget"]
+    return {
+        "code": payload["code"],
+        "type": payload["type"],
+        "title": payload["title"],
+        "description": payload["description"],
+        "rarity": payload["rarity"],
+        "progress": min(int(payload["progress"]), int(target)),
+        "target": int(target),
+        "unlocked": bool(payload["lit"]),
+        "unlockedAt": payload["litAt"],
+        "friend": payload["friend"],
+    }
+
+
+def evaluate_badges_for_user(
+    db: sqlite3.Connection,
+    user_id: str,
+    touched_friend_user_id: str | None = None,
+    emit_events: bool = False,
+    now: int | None = None,
+) -> list[dict[str, Any]]:
+    actual_now = now or utc_now()
+    changes: list[dict[str, Any]] = []
+
+    def upsert_state(definition: dict[str, Any], friend_user_id: str, friend_row: sqlite3.Row | None) -> None:
+        progress = compute_badge_progress(db, user_id, definition, friend_user_id or None)
+        level = badge_level_for_progress(definition, progress)
+        if level <= 0:
+            return
+        state = db.execute(
+            """
+            SELECT * FROM badge_states
+            WHERE user_id = ? AND badge_code = ? AND friend_user_id = ?
+            """,
+            (user_id, definition["code"], friend_user_id),
+        ).fetchone()
+        previous_level = int(state["level"] or 0) if state else 0
+        if previous_level >= level:
+            db.execute(
+                """
+                UPDATE badge_states SET progress = ?
+                WHERE user_id = ? AND badge_code = ? AND friend_user_id = ?
+                """,
+                (progress, user_id, definition["code"], friend_user_id),
+            )
+            return
+        if state is None:
+            db.execute(
+                """
+                INSERT INTO badge_states (id, user_id, badge_code, friend_user_id, level, progress, lit_at, upgraded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (f"badge_{uuid.uuid4().hex}", user_id, definition["code"], friend_user_id, level, progress, actual_now, actual_now),
+            )
+        else:
+            db.execute(
+                """
+                UPDATE badge_states
+                SET level = ?, progress = ?, upgraded_at = ?, lit_at = COALESCE(lit_at, ?)
+                WHERE user_id = ? AND badge_code = ? AND friend_user_id = ?
+                """,
+                (level, progress, actual_now, actual_now, user_id, definition["code"], friend_user_id),
+            )
+        payload = badge_payload(db, user_id, definition, friend_row)
+        event_type = "badge_lit" if previous_level == 0 else "badge_upgraded"
+        payload["previousLevel"] = previous_level
+        changes.append(payload)
+        if emit_events:
+            create_user_event(db, user_id, event_type, {"badge": payload}, actual_now)
+
+    for definition in BADGE_DEFINITIONS:
+        if definition["type"] == "personal":
+            upsert_state(definition, "", None)
+
+    friend_rows = accepted_friend_rows(db, user_id)
+    if touched_friend_user_id:
+        friend_rows = [row for row in friend_rows if row["id"] == touched_friend_user_id]
+    for friend_row in friend_rows:
+        for definition in BADGE_DEFINITIONS:
+            if definition["type"] == "friend":
+                upsert_state(definition, friend_row["id"], friend_row)
+    return changes
+
+
+def evaluate_achievements_for_user(
+    db: sqlite3.Connection,
+    user_id: str,
+    touched_friend_user_id: str | None = None,
+    emit_events: bool = False,
+    now: int | None = None,
+) -> list[dict[str, Any]]:
+    return evaluate_badges_for_user(db, user_id, touched_friend_user_id, emit_events, now)
+
+
+def unlock_achievement(
+    db: sqlite3.Connection,
+    user_id: str,
+    definition: dict[str, Any],
+    friend_user_id: str,
+    now: int,
+    emit_event: bool,
+) -> list[dict[str, Any]]:
+    return evaluate_badges_for_user(db, user_id, friend_user_id or None, emit_event, now)
+
+
+def badges_for_user(db: sqlite3.Connection, user_id: str) -> dict[str, Any]:
+    evaluate_badges_for_user(db, user_id, emit_events=False)
+    friend_rows = accepted_friend_rows(db, user_id)
+    personal = [
+        badge_payload(db, user_id, definition)
+        for definition in BADGE_DEFINITIONS
+        if definition["type"] == "personal"
+    ]
+    friend_badges_flat = [
+        badge_payload(db, user_id, definition, friend_row)
+        for friend_row in friend_rows
+        for definition in BADGE_DEFINITIONS
+        if definition["type"] == "friend"
+    ]
+    friend_groups = [
+        {
+            "friend": public_profile_user_row(friend_row),
+            "badges": [item for item in friend_badges_flat if item["friend"] and item["friend"]["id"] == friend_row["id"]],
+        }
+        for friend_row in friend_rows
+    ]
+    all_items = personal + friend_badges_flat
+    lit_items = [item for item in all_items if item["lit"]]
+    recent = max(lit_items, key=lambda item: item.get("upgradedAt") or 0) if lit_items else None
+    return {
+        "summary": {
+            "lit": len(lit_items),
+            "total": len(all_items),
+            "personalLit": sum(1 for item in personal if item["lit"]),
+            "friendLit": sum(1 for item in friend_badges_flat if item["lit"]),
+            "highestLevel": max([int(item["level"]) for item in all_items], default=0),
+            "recentUpgradedAt": recent.get("upgradedAt") if recent else None,
+        },
+        "personal": personal,
+        "friendBadges": friend_groups,
+    }
+
+
+def achievements_for_user(db: sqlite3.Connection, user_id: str) -> dict[str, Any]:
+    payload = badges_for_user(db, user_id)
+    friend_achievements = [badge for group in payload["friendBadges"] for badge in group["badges"]]
+    return {
+        "summary": {
+            "unlocked": payload["summary"]["lit"],
+            "total": payload["summary"]["total"],
+            "personalUnlocked": payload["summary"]["personalLit"],
+            "friendUnlocked": payload["summary"]["friendLit"],
+        },
+        "personal": [achievement_payload(db, user_id, definition) for definition in BADGE_DEFINITIONS if definition["type"] == "personal"],
+        "friendAchievements": [
+            {
+                "code": item["code"],
+                "type": item["type"],
+                "title": item["title"],
+                "description": item["description"],
+                "rarity": item["rarity"],
+                "progress": min(int(item["progress"]), int(item["nextTarget"] or item["currentTarget"])),
+                "target": int(item["nextTarget"] or item["currentTarget"]),
+                "unlocked": bool(item["lit"]),
+                "unlockedAt": item["litAt"],
+                "friend": item["friend"],
+            }
+            for item in friend_achievements
+        ],
+    }
+
+
 def seed_local_demo_user(db: sqlite3.Connection) -> None:
-    email = "test@163.com"
-    display_name = "Shinochanwww"
-    password = "12345678"
+    email = os.environ.get("TOUCH_DEMO_EMAIL", "").strip()
+    display_name = os.environ.get("TOUCH_DEMO_DISPLAY_NAME", "").strip()
+    password = os.environ.get("TOUCH_DEMO_PASSWORD", "").strip()
+    if not email or not display_name or not password:
+        return
     now = utc_now()
 
     def upsert_demo_user(
@@ -602,7 +1167,7 @@ def seed_local_demo_user(db: sqlite3.Connection) -> None:
         background_key: str,
     ) -> None:
         existing = db.execute("SELECT id FROM users WHERE id = ? OR email = ?", (demo_user_id, demo_email)).fetchone()
-        salt, password_hash = hash_password("12345678")
+        salt, password_hash = hash_password(password)
         if existing is None:
             db.execute(
                 """
@@ -805,6 +1370,28 @@ def get_authenticated_user_id(headers: dict[str, str]) -> str:
     return verify_access_token(auth_header[len(prefix) :].strip())
 
 
+def client_ip_from_headers(headers: dict[str, str], fallback: str) -> str:
+    forwarded = headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+    return forwarded or fallback
+
+
+def check_rate_limit(method: str, path: str, client_ip: str) -> None:
+    limit_and_bucket = RATE_LIMIT_RULES.get((method, path))
+    if limit_and_bucket is None:
+        return
+    limit, bucket = limit_and_bucket
+    now = utc_now()
+    cutoff = now - RATE_LIMIT_WINDOW_SECONDS
+    key = (client_ip, bucket)
+    with RATE_LIMIT_LOCK:
+        timestamps = [value for value in RATE_LIMIT_BUCKETS.get(key, []) if value > cutoff]
+        if len(timestamps) >= limit:
+            RATE_LIMIT_BUCKETS[key] = timestamps
+            raise ApiError(429, "rate_limited", "操作太频繁，请稍后再试。")
+        timestamps.append(now)
+        RATE_LIMIT_BUCKETS[key] = timestamps
+
+
 def parse_multipart_file(raw_body: bytes, boundary: str, field_name: str) -> tuple[bytes, str]:
     marker = f"--{boundary}".encode("utf-8")
     for part in raw_body.split(marker):
@@ -827,20 +1414,27 @@ def parse_multipart_file(raw_body: bytes, boundary: str, field_name: str) -> tup
 
 
 def safe_avatar_extension(filename: str, content: bytes) -> str:
-    lower_name = filename.lower()
     if content.startswith(b"\xff\xd8\xff"):
         return ".jpg"
     if content.startswith(b"\x89PNG\r\n\x1a\n"):
         return ".png"
     if content.startswith(b"RIFF") and b"WEBP" in content[:16]:
         return ".webp"
-    if lower_name.endswith((".jpg", ".jpeg")):
-        return ".jpg"
-    if lower_name.endswith(".png"):
-        return ".png"
-    if lower_name.endswith(".webp"):
-        return ".webp"
     raise ApiError(400, "unsupported_avatar_type", "Avatar must be JPG, PNG, or WebP.")
+
+
+def validate_event_image_base64(raw: str) -> str:
+    if len(raw) > 1_400_000:
+        raise ApiError(413, "image_too_large", "Event image is too large.")
+    try:
+        decoded = base64.b64decode(raw, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ApiError(400, "invalid_image", "Event image data is invalid.") from exc
+    if len(decoded) > 1_000_000:
+        raise ApiError(413, "image_too_large", "Event image is too large.")
+    if not decoded.startswith(b"\xff\xd8\xff"):
+        raise ApiError(400, "unsupported_image_type", "Event images must be JPEG.")
+    return raw
 
 
 class TouchHandler(BaseHTTPRequestHandler):
@@ -848,7 +1442,7 @@ class TouchHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: Any) -> None:
         # Avoid logging request bodies or tokens.
-        print(f"{self.address_string()} - {fmt % args}")
+        print(f"{self.client_address[0]} - {fmt % args}")
 
     def do_OPTIONS(self) -> None:
         self.send_response(204)
@@ -870,6 +1464,11 @@ class TouchHandler(BaseHTTPRequestHandler):
     def handle_request(self, method: str) -> None:
         try:
             path = urlparse(self.path).path
+            check_rate_limit(
+                method=method,
+                path=path,
+                client_ip=client_ip_from_headers(self.request_headers(), self.client_address[0]),
+            )
             if method == "GET" and path == "/health":
                 self.respond_json(200, {"status": "ok", "time": utc_now()})
                 return
@@ -893,6 +1492,12 @@ class TouchHandler(BaseHTTPRequestHandler):
                 return
             if method == "GET" and path == "/events/stream":
                 self.handle_events_stream()
+                return
+            if method == "GET" and path == "/achievements":
+                self.handle_achievements()
+                return
+            if method == "GET" and path == "/badges":
+                self.handle_badges()
                 return
             if method == "GET" and path.startswith("/uploads/avatars/"):
                 self.handle_avatar_file(path)
@@ -1375,6 +1980,18 @@ class TouchHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             return
 
+    def handle_achievements(self) -> None:
+        user_id = get_authenticated_user_id(self.request_headers())
+        with connect_db() as db:
+            payload = achievements_for_user(db, user_id)
+        self.respond_json(200, payload)
+
+    def handle_badges(self) -> None:
+        user_id = get_authenticated_user_id(self.request_headers())
+        with connect_db() as db:
+            payload = badges_for_user(db, user_id)
+        self.respond_json(200, payload)
+
     def handle_friend_search(self) -> None:
         user_id = get_authenticated_user_id(self.request_headers())
         params = parse_qs(urlparse(self.path).query)
@@ -1393,7 +2010,7 @@ class TouchHandler(BaseHTTPRequestHandler):
                 """,
                 (user_id, f"%{q}%"),
             ).fetchall()
-        self.respond_json(200, {"users": [public_user_row(row) for row in rows]})
+        self.respond_json(200, {"users": [public_profile_user_row(row) for row in rows]})
 
     def handle_friend_request_create(self) -> None:
         requester_user_id = get_authenticated_user_id(self.request_headers())
@@ -1443,7 +2060,7 @@ class TouchHandler(BaseHTTPRequestHandler):
                 "friend_request_received",
                 {
                     "friendship": target_payload,
-                    "fromUser": public_user_row(requester) if requester else None,
+                    "fromUser": public_profile_user_row(requester) if requester else None,
                 },
                 now,
             )
@@ -1474,7 +2091,7 @@ class TouchHandler(BaseHTTPRequestHandler):
                 event_type,
                 {
                     "friendship": public_friendship(db, updated, row["requester_user_id"]),
-                    "fromUser": public_user_row(db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()),
+                    "fromUser": public_profile_user_row(db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()),
                 },
                 now,
             )
@@ -1578,10 +2195,14 @@ class TouchHandler(BaseHTTPRequestHandler):
             image_values = []
         if not isinstance(image_values, list):
             raise ApiError(400, "invalid_images", "Event images must be a list.")
-        image_base64_list = [str(value).strip() for value in image_values if str(value).strip()]
+        image_base64_list = [
+            validate_event_image_base64(str(value).strip())
+            for value in image_values
+            if str(value).strip()
+        ]
         legacy_image = str(body.get("imageBase64", "")).strip()
         if legacy_image and not image_base64_list:
-            image_base64_list = [legacy_image]
+            image_base64_list = [validate_event_image_base64(legacy_image)]
         if len(event_date) != 10:
             raise ApiError(400, "invalid_date", "Event date is required.")
         if not isinstance(participant_ids, list):
@@ -1620,6 +2241,7 @@ class TouchHandler(BaseHTTPRequestHandler):
                 )
             row = db.execute("SELECT * FROM day_events WHERE id = ?", (event_id,)).fetchone()
             payload = public_day_event(db, row)
+            evaluate_achievements_for_user(db, user_id, emit_events=True, now=now)
         self.respond_json(201, {"event": payload})
 
     def handle_day_event_delete(self, path: str) -> None:
@@ -1654,7 +2276,11 @@ class TouchHandler(BaseHTTPRequestHandler):
         if not isinstance(image_values, list):
             raise ApiError(400, "invalid_images", "Event images must be a list.")
         participant_ids = [str(value).strip() for value in participant_ids if str(value).strip()]
-        image_base64_list = [str(value).strip() for value in image_values if str(value).strip()]
+        image_base64_list = [
+            validate_event_image_base64(str(value).strip())
+            for value in image_values
+            if str(value).strip()
+        ]
         if len(participant_ids) > 20:
             raise ApiError(400, "too_many_participants", "Too many participants.")
         if len(image_base64_list) > 6:
@@ -1693,6 +2319,7 @@ class TouchHandler(BaseHTTPRequestHandler):
                 )
             updated = db.execute("SELECT * FROM day_events WHERE id = ?", (event_id,)).fetchone()
             payload = public_day_event_for_viewer(db, updated, user_id)
+            evaluate_achievements_for_user(db, user_id, emit_events=True, now=now)
         self.respond_json(200, {"event": payload})
 
     def handle_meet_token_create(self) -> None:
@@ -1782,7 +2409,7 @@ class TouchHandler(BaseHTTPRequestHandler):
                     200,
                     {
                         "status": "friend_required",
-                        "user": public_user_row(scanned),
+                        "user": public_profile_user_row(scanned),
                         "friendship": public_friendship(db, friendship, scanner_user_id) if friendship else None,
                     },
                 )
@@ -1832,7 +2459,7 @@ class TouchHandler(BaseHTTPRequestHandler):
                 "meeting_confirmed",
                 {
                     "meeting": public_meeting(meeting_row),
-                    "peer": public_user_row(scanned),
+                    "peer": public_profile_user_row(scanned),
                     "role": "scanner",
                 },
                 now,
@@ -1843,10 +2470,24 @@ class TouchHandler(BaseHTTPRequestHandler):
                 "meeting_confirmed",
                 {
                     "meeting": public_meeting(scanned_meeting_row),
-                    "peer": public_user_row(scanner),
+                    "peer": public_profile_user_row(scanner),
                     "role": "scanned",
                 },
                 now,
+            )
+            evaluate_achievements_for_user(
+                db,
+                scanner_user_id,
+                touched_friend_user_id=scanned_user_id,
+                emit_events=True,
+                now=now,
+            )
+            evaluate_achievements_for_user(
+                db,
+                scanned_user_id,
+                touched_friend_user_id=scanner_user_id,
+                emit_events=True,
+                now=now,
             )
 
         self.respond_json(201, {"status": "confirmed", "meeting": public_meeting(meeting_row)})
@@ -1861,10 +2502,12 @@ class TouchHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def write_common_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", CORS_ALLOW_ORIGIN)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
 
 
 def main() -> None:
