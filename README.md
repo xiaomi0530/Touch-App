@@ -1,64 +1,42 @@
 # Touch
 
-Touch is a mobile app for people who want a cleaner way to remember real meetings, keep friend relationships organized, and turn everyday interactions into something more vivid.
+Touch 是一款记录真实见面关系的安卓应用，帮助你更清晰地整理好友、名片、日历见面记录和互动徽章，也支持把手机里的笔记照片快速打包成 ZIP 保存或分享。
 
-It combines:
+## 主要功能
 
-- NFC-based tap-to-meet recording
-- Friend management and profile cards
-- Calendar views for meeting history
-- Staged badges for long-term interaction progress
-- Local note photo packaging into shareable ZIP files
+- NFC 碰一碰记录见面
+- 好友搜索、申请、删除、屏蔽和备注
+- 个人名片编辑
+- 周 / 月 / 年日历查看
+- 徽章成长系统
+- 手机本地打包笔记照片并分享或保存
 
-## What Touch feels like
+## 使用方式
 
-Touch is designed to be:
+### 安卓端
 
-- Fast to use
-- Friendly on the eyes
-- Easy to understand at a glance
-- Built around real social interactions, not empty checklists
+用 Android Studio 打开 `Touch/`，运行到模拟器或真机即可。
 
-## Main features
-
-- Register and log in to your account
-- Record a meeting by tapping two phones together
-- Search, add, remove, block, and remark friends
-- Browse meeting history by week, month, or year
-- Edit your profile card with avatar, bio, birthday, gender, and background
-- Collect badges that grow through repeated interaction
-- Package classroom note photos into a ZIP on your phone and share or save them locally
-
-## Who it is for
-
-Touch is aimed at users who want:
-
-- A lightweight social memory log
-- A private friend-based interaction record
-- A visually polished calendar and badge experience
-- A practical phone tool for note photo organization
-
-## Try it locally
-
-### Android app
-
-Open `Touch/` in Android Studio and run it on an emulator or phone.
-
-### Backend
+### 本地后端
 
 ```powershell
 cd TouchBackend
 python .\server.py
 ```
 
-The backend is for development and testing.
+后端用于开发和测试，不是生产环境。
 
-## Chinese version
+## 适合谁
 
-- [中文说明](README.zh-CN.md)
+Touch 适合想要：
 
-## More docs
+- 记录真实见面的人
+- 管理好友关系的人
+- 用日历回顾互动历史的人
+- 快速整理课堂笔记照片的人
 
-- [Backend README](TouchBackend/README.md)
-- [Security strategy](SECURITY_STRATEGY.md)
-- [Agent specification](AGENTS.md)
+## 相关文档
+
+- [后端说明](TouchBackend/README.md)
+- [安全策略](SECURITY_STRATEGY.md)
+- [Agent 规范](AGENTS.md)
